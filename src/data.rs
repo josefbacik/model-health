@@ -1,0 +1,192 @@
+use std::path::Path;
+
+use chrono::NaiveDate;
+use polars::prelude::*;
+use tracing::info;
+
+use crate::config::Config;
+use crate::error::{AppError, Result};
+
+/// Load Parquet files for a given entity type from garmin-cli's storage.
+fn scan_entity(base_path: &Path, entity_dir: &str) -> Result<LazyFrame> {
+    let pattern = base_path.join(entity_dir).join("*.parquet");
+    let pattern_str = pattern.to_string_lossy().to_string();
+
+    LazyFrame::scan_parquet(&pattern_str, Default::default())
+        .map_err(|e| AppError::Data(format!("Failed to scan {entity_dir} parquet files: {e}")))
+}
+
+/// Load daily health data as a LazyFrame.
+pub fn load_daily_health(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "daily_health")
+}
+
+/// Load performance metrics as a LazyFrame.
+pub fn load_performance_metrics(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "performance_metrics")
+}
+
+/// Load activities as a LazyFrame.
+pub fn load_activities(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "activities")
+}
+
+/// Load weight entries as a LazyFrame.
+pub fn load_weight(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "weight")
+}
+
+/// Filter a LazyFrame by date range.
+#[allow(dead_code)]
+pub fn filter_date_range(
+    lf: LazyFrame,
+    date_col: &str,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+) -> LazyFrame {
+    let mut lf = lf;
+    if let Some(from) = from {
+        lf = lf.filter(col(date_col).gt_eq(lit(from)));
+    }
+    if let Some(to) = to {
+        lf = lf.filter(col(date_col).lt_eq(lit(to)));
+    }
+    lf
+}
+
+/// Profile data quality for a given dataset.
+/// Prints column names, types, null percentages, date range, and basic stats.
+pub fn profile_data(config: &Config) -> Result<()> {
+    println!("=== Data Profile ===\n");
+    println!("Storage path: {}\n", config.garmin_storage_path.display());
+
+    // Profile each entity type
+    for (name, loader) in [
+        (
+            "Daily Health",
+            load_daily_health as fn(&Config) -> Result<LazyFrame>,
+        ),
+        ("Performance Metrics", load_performance_metrics),
+        ("Activities", load_activities),
+        ("Weight", load_weight),
+    ] {
+        match loader(config) {
+            Ok(lf) => {
+                println!("--- {name} ---");
+                match profile_lazyframe(lf, name) {
+                    Ok(()) => {}
+                    Err(e) => println!("  Error profiling: {e}"),
+                }
+                println!();
+            }
+            Err(e) => {
+                println!("--- {name} ---");
+                println!("  Not available: {e}\n");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn profile_lazyframe(lf: LazyFrame, _entity_name: &str) -> Result<()> {
+    let df = lf.collect()?;
+    let row_count = df.height();
+    println!("  Rows: {row_count}");
+
+    if row_count == 0 {
+        println!("  (empty)");
+        return Ok(());
+    }
+
+    // Print schema
+    println!("  Columns:");
+    let schema = df.schema();
+    for (name, dtype) in schema.iter() {
+        let null_count = df.column(name.as_str())?.null_count();
+        let null_pct = if row_count > 0 {
+            (null_count as f64 / row_count as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!("    {name:<35} {dtype:<20} nulls: {null_count:>6} ({null_pct:>5.1}%)");
+    }
+
+    // Date range if there's a 'date' column
+    if schema.contains("date") {
+        let dates = df.column("date")?;
+        if let (Ok(min_date), Ok(max_date)) = (dates.min_reduce(), dates.max_reduce()) {
+            println!(
+                "  Date range: {:?} to {:?}",
+                min_date.value(),
+                max_date.value()
+            );
+        }
+
+        // Count distinct dates for gap detection
+        if let Ok(n_dates) = dates.n_unique() {
+            println!("  Unique dates: {n_dates}");
+        }
+    }
+
+    // Basic stats for numeric columns
+    println!("  Key stats:");
+    for col_name in [
+        "resting_hr",
+        "steps",
+        "sleep_seconds",
+        "avg_stress",
+        "vo2max",
+        "weight_kg",
+        "training_readiness",
+    ] {
+        if schema.contains(col_name)
+            && let Ok(col) = df.column(col_name)
+        {
+            let series = col.as_materialized_series();
+            let mean = series.mean();
+            let non_null = row_count - col.null_count();
+            if let Some(mean) = mean {
+                println!("    {col_name:<30} mean: {mean:>8.1}  non-null: {non_null}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if we have enough data to train a model.
+pub fn validate_training_data(config: &Config) -> Result<()> {
+    let lf = load_daily_health(config)?;
+    let df = lf.collect()?;
+    let row_count = df.height();
+
+    if row_count < config.min_training_days {
+        return Err(AppError::Data(format!(
+            "Need at least {} days of data for training, but only have {}. Run `model-health sync` to download more data.",
+            config.min_training_days, row_count
+        )));
+    }
+
+    // Check core columns have acceptable null rates
+    let max_null_pct = 0.30;
+    for col_name in ["resting_hr", "sleep_seconds", "steps"] {
+        if let Ok(col) = df.column(col_name) {
+            let null_pct = col.null_count() as f64 / row_count as f64;
+            if null_pct > max_null_pct {
+                return Err(AppError::Data(format!(
+                    "Column '{col_name}' has {:.0}% null values (max allowed: {:.0}%). Data quality is insufficient for training.",
+                    null_pct * 100.0,
+                    max_null_pct * 100.0
+                )));
+            }
+        } else {
+            return Err(AppError::Data(format!(
+                "Required column '{col_name}' not found in daily health data"
+            )));
+        }
+    }
+
+    info!(rows = row_count, "Training data validation passed");
+    Ok(())
+}
