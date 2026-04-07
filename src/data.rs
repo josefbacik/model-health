@@ -40,6 +40,11 @@ pub fn load_weight(config: &Config) -> Result<LazyFrame> {
     scan_entity(&config.garmin_storage_path, "weight")
 }
 
+/// Load blood pressure measurements as a LazyFrame.
+pub fn load_blood_pressure(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "blood_pressure")
+}
+
 /// Filter a LazyFrame by date range.
 #[allow(dead_code)]
 pub fn filter_date_range(
@@ -73,6 +78,7 @@ pub fn profile_data(config: &Config) -> Result<()> {
         ("Performance Metrics", load_performance_metrics),
         ("Activities", load_activities),
         ("Weight", load_weight),
+        ("Blood Pressure", load_blood_pressure),
     ] {
         match loader(config) {
             Ok(lf) => {
@@ -139,19 +145,41 @@ fn profile_lazyframe(lf: LazyFrame, _entity_name: &str) -> Result<()> {
         "resting_hr",
         "steps",
         "sleep_seconds",
+        "sleep_score",
         "avg_stress",
+        "avg_respiration",
+        "avg_spo2",
+        "lowest_spo2",
+        "hrv_last_night",
+        "hrv_weekly_avg",
+        "body_battery_start",
+        "body_battery_end",
         "vo2max",
-        "weight_kg",
+        "fitness_age",
         "training_readiness",
+        "endurance_score",
+        "weight_kg",
+        "bmi",
+        "body_fat",
+        "systolic",
+        "diastolic",
+        "pulse",
     ] {
         if schema.contains(col_name)
             && let Ok(col) = df.column(col_name)
         {
             let series = col.as_materialized_series();
             let mean = series.mean();
+            let min = series.min_reduce().ok().map(|s| format!("{}", s.value()));
+            let max = series.max_reduce().ok().map(|s| format!("{}", s.value()));
             let non_null = row_count - col.null_count();
             if let Some(mean) = mean {
-                println!("    {col_name:<30} mean: {mean:>8.1}  non-null: {non_null}");
+                println!(
+                    "    {col_name:<22} mean: {mean:>8.1}  min: {:>8}  max: {:>8}  non-null: {}",
+                    min.as_deref().unwrap_or("?"),
+                    max.as_deref().unwrap_or("?"),
+                    non_null
+                );
             }
         }
     }

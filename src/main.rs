@@ -31,6 +31,20 @@ enum Commands {
         /// End date (YYYY-MM-DD, defaults to today)
         #[arg(long)]
         to: Option<NaiveDate>,
+        /// Re-fetch dates even if already cached locally. Note: this is an
+        /// *upsert* — fetched rows overwrite existing ones (dedup-keep-last),
+        /// but rows in the existing parquet that the API no longer returns
+        /// for that range are preserved. For a true clean rebuild, delete
+        /// the relevant subdirectory of the garmin storage path before
+        /// running.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Dump raw JSON from each Garmin endpoint for a single date (debugging)
+    Probe {
+        /// Date to probe (YYYY-MM-DD)
+        #[arg(long)]
+        date: NaiveDate,
     },
     /// Show data coverage and sync status
     Status,
@@ -60,8 +74,11 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::load()?;
 
     match cli.command {
-        Commands::Fetch { from, to } => {
-            fetch::fetch_all(&config, from, to).await?;
+        Commands::Fetch { from, to, force } => {
+            fetch::fetch_all(&config, from, to, force).await?;
+        }
+        Commands::Probe { date } => {
+            fetch::probe(date).await?;
         }
         Commands::Status => {
             println!("Garmin storage: {}", config.garmin_storage_path.display());
@@ -82,6 +99,11 @@ async fn main() -> anyhow::Result<()> {
                     Box::new(data::load_activities),
                 ),
                 ("Weight", "date", Box::new(data::load_weight)),
+                (
+                    "Blood Pressure",
+                    "date",
+                    Box::new(data::load_blood_pressure),
+                ),
             ];
 
             for (name, date_col, loader) in &datasets {

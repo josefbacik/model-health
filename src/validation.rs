@@ -11,6 +11,11 @@
 //!    - `avg_stress < 0` (Garmin uses `-1` for no data)
 //!    - `max_stress < 0`
 //!
+//!    Note: as of the weight/BP refactor, `fetch.rs` now also filters these
+//!    sentinels at the API boundary before writing to parquet. The rules
+//!    below are kept as a defensive layer so older parquet files written by
+//!    earlier versions (or by garmin-cli) get cleaned at training time.
+//!
 //! 2. **Implausible values → null**
 //!    - `resting_hr` outside `[25, 200]` — floor accommodates elite endurance athletes
 //!    - `sleep_seconds <= 0` or `> 16` hours
