@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Garmin data access
-garmin-cli = "2.0.0"
+# Garmin API client
+garmin-connect = { path = "../garmin-connect" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Async runtime (garmin-cli uses tokio)
+# Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # Data processing
@@ -38,5 +38,5 @@ chrono = { version = "0.4", features = ["serde"] }
 # Config/paths
 dirs = "6"
 
-# Password input
-libc = "0.2"
+[dev-dependencies]
+tempfile = "3.27.0"

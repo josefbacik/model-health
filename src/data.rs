@@ -12,7 +12,11 @@ fn scan_entity(base_path: &Path, entity_dir: &str) -> Result<LazyFrame> {
     let pattern = base_path.join(entity_dir).join("*.parquet");
     let pattern_str = pattern.to_string_lossy().to_string();
 
-    LazyFrame::scan_parquet(&pattern_str, Default::default())
+    let args = ScanArgsParquet {
+        allow_missing_columns: true,
+        ..Default::default()
+    };
+    LazyFrame::scan_parquet(&pattern_str, args)
         .map_err(|e| AppError::Data(format!("Failed to scan {entity_dir} parquet files: {e}")))
 }
 
@@ -153,6 +157,58 @@ fn profile_lazyframe(lf: LazyFrame, _entity_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Summary info for a dataset: row count and date range.
+pub struct DataSummary {
+    pub row_count: usize,
+    pub min_date: Option<String>,
+    pub max_date: Option<String>,
+}
+
+/// Get a quick summary (row count, date range) for a dataset.
+pub fn summarize(lf: LazyFrame, date_col: &str) -> Result<DataSummary> {
+    // Compute min/max via lazy aggregation so polars handles type formatting
+    let stats = lf
+        .clone()
+        .select([
+            col(date_col).min().alias("min_date"),
+            col(date_col).max().alias("max_date"),
+            col(date_col).count().alias("count"),
+        ])
+        .collect()?;
+
+    let row_count = stats
+        .column("count")?
+        .get(0)
+        .ok()
+        .and_then(|v| v.try_extract::<u32>().ok())
+        .unwrap_or(0) as usize;
+
+    if row_count == 0 {
+        return Ok(DataSummary {
+            row_count,
+            min_date: None,
+            max_date: None,
+        });
+    }
+
+    let min_date = stats
+        .column("min_date")?
+        .get(0)
+        .ok()
+        .map(|v| format!("{}", v));
+    let max_date = stats
+        .column("max_date")?
+        .get(0)
+        .ok()
+        .map(|v| format!("{}", v));
+
+    Ok(DataSummary {
+        row_count,
+        min_date,
+        max_date,
+    })
 }
 
 /// Check if we have enough data to train a model.

@@ -4,6 +4,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::data;
 use crate::error::{AppError, Result};
+use crate::validation;
 
 /// Names of all feature columns produced by the pipeline.
 pub fn feature_columns() -> Vec<&'static str> {
@@ -29,11 +30,19 @@ pub fn feature_columns() -> Vec<&'static str> {
 pub fn build_feature_matrix(config: &Config, target: &str) -> Result<(DataFrame, Vec<String>)> {
     info!("Building feature matrix");
 
-    // Load raw data
+    // Load raw data, then clean. The cleaning happens before any feature
+    // computation so sentinel values and implausible readings don't pollute
+    // rolling-window means.
     let health_lf = data::load_daily_health(config)?;
+    let before = health_lf.clone().collect()?;
+    let cleaned_lf = validation::clean_daily_health(health_lf)?;
+    let after = cleaned_lf.clone().collect()?;
+    validation::log_cleaning_diff(&before, &after);
 
-    // Start with daily health features
-    let mut lf = health_lf
+    // Note: cleaning is order-independent (no stateful operations), so it's
+    // safe to sort here. If you ever add a stateful rule like forward-fill
+    // to validation, sort first.
+    let mut lf = cleaned_lf
         .sort(["date"], Default::default())
         // Core daily features
         .with_columns([

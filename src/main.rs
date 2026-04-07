@@ -2,8 +2,10 @@ mod config;
 mod data;
 mod error;
 mod features;
+mod fetch;
 mod model;
 mod sync;
+mod validation;
 
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
@@ -21,19 +23,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Sync data from Garmin Connect
-    Sync {
-        /// Start date for backfill (YYYY-MM-DD)
+    /// Fetch health + performance data from Garmin Connect
+    Fetch {
+        /// Start date (YYYY-MM-DD)
         #[arg(long)]
-        from: Option<NaiveDate>,
-        /// End date (YYYY-MM-DD)
+        from: NaiveDate,
+        /// End date (YYYY-MM-DD, defaults to today)
         #[arg(long)]
         to: Option<NaiveDate>,
-        /// Force re-download of existing data
-        #[arg(long)]
-        force: bool,
     },
-    /// Show sync status and data coverage
+    /// Show data coverage and sync status
     Status,
     /// Profile data quality (column names, null rates, stats)
     Profile,
@@ -61,29 +60,44 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::load()?;
 
     match cli.command {
-        Commands::Sync { from, to, force } => {
-            let stats = sync::run_sync(&config, from, to, force).await?;
-            println!("{stats}");
+        Commands::Fetch { from, to } => {
+            fetch::fetch_all(&config, from, to).await?;
         }
         Commands::Status => {
-            println!("Config: {}", config::Config::config_path().display());
             println!("Garmin storage: {}", config.garmin_storage_path.display());
             println!("Model data: {}", config.data_dir.display());
             println!();
-            // Quick summary
-            match data::load_daily_health(&config) {
-                Ok(lf) => match lf.collect() {
-                    Ok(df) => println!("Daily health records: {}", df.height()),
-                    Err(e) => println!("Daily health: error loading ({e})"),
-                },
-                Err(_) => println!("Daily health: no data yet"),
-            }
-            match data::load_activities(&config) {
-                Ok(lf) => match lf.collect() {
-                    Ok(df) => println!("Activity records: {}", df.height()),
-                    Err(e) => println!("Activities: error loading ({e})"),
-                },
-                Err(_) => println!("Activities: no data yet"),
+
+            type Loader = Box<dyn Fn(&config::Config) -> error::Result<polars::prelude::LazyFrame>>;
+            let datasets: Vec<(&str, &str, Loader)> = vec![
+                ("Daily Health", "date", Box::new(data::load_daily_health)),
+                (
+                    "Performance",
+                    "date",
+                    Box::new(data::load_performance_metrics),
+                ),
+                (
+                    "Activities",
+                    "start_time_local",
+                    Box::new(data::load_activities),
+                ),
+                ("Weight", "date", Box::new(data::load_weight)),
+            ];
+
+            for (name, date_col, loader) in &datasets {
+                match loader(&config) {
+                    Ok(lf) => match data::summarize(lf, date_col) {
+                        Ok(s) if s.row_count > 0 => {
+                            let range = match (&s.min_date, &s.max_date) {
+                                (Some(min), Some(max)) => format!("{} to {}", min, max),
+                                _ => "n/a".to_string(),
+                            };
+                            println!("{name:<20} {:<8} rows    range: {}", s.row_count, range);
+                        }
+                        _ => println!("{name:<20} no data yet"),
+                    },
+                    Err(_) => println!("{name:<20} no data yet"),
+                }
             }
         }
         Commands::Profile => {
