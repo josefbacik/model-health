@@ -350,17 +350,17 @@ fn load_existing_months(config: &Config, entity_dir: &str) -> Result<HashSet<(i3
 
 /// Load the set of dates already present in parquet files for a given entity.
 fn load_existing_dates(config: &Config, entity_dir: &str) -> Result<HashSet<NaiveDate>> {
-    let pattern = config
-        .garmin_storage_path
-        .join(entity_dir)
-        .join("*.parquet");
+    let dir = config.garmin_storage_path.join(entity_dir);
+    // Polars' scan_parquet returns Ok for a glob that matches zero files and
+    // only fails later at collect() with "expected at least 1 source", so
+    // short-circuit before scanning when nothing is on disk yet.
+    if !crate::data::dir_has_parquet(&dir) {
+        return Ok(HashSet::new());
+    }
+
+    let pattern = dir.join("*.parquet");
     let pattern_str = pattern.to_string_lossy().to_string();
-
-    let lf = match LazyFrame::scan_parquet(&pattern_str, Default::default()) {
-        Ok(lf) => lf,
-        Err(_) => return Ok(HashSet::new()), // No files yet
-    };
-
+    let lf = LazyFrame::scan_parquet(&pattern_str, Default::default())?;
     let df = lf.select([col("date")]).collect()?;
     let dates = df.column("date")?;
 

@@ -7,9 +7,31 @@ use tracing::info;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
+/// Returns true if `dir` exists and contains at least one `.parquet` file.
+///
+/// Used as a pre-check before `LazyFrame::scan_parquet`, which will happily
+/// return Ok for a glob that matches zero files and only fail later at
+/// `.collect()` time with a confusing "expected at least 1 source" error.
+pub fn dir_has_parquet(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("parquet"))
+        })
+        .unwrap_or(false)
+}
+
 /// Load Parquet files for a given entity type from garmin-cli's storage.
 fn scan_entity(base_path: &Path, entity_dir: &str) -> Result<LazyFrame> {
-    let pattern = base_path.join(entity_dir).join("*.parquet");
+    let dir = base_path.join(entity_dir);
+    if !dir_has_parquet(&dir) {
+        return Err(AppError::Data(format!(
+            "No parquet files found for {entity_dir} in {}",
+            dir.display()
+        )));
+    }
+
+    let pattern = dir.join("*.parquet");
     let pattern_str = pattern.to_string_lossy().to_string();
 
     let args = ScanArgsParquet {
@@ -241,6 +263,15 @@ pub fn summarize(lf: LazyFrame, date_col: &str) -> Result<DataSummary> {
 
 /// Check if we have enough data to train a model.
 pub fn validate_training_data(config: &Config) -> Result<()> {
+    // Surface the friendly "run sync" message when nothing has been fetched
+    // yet, instead of letting `scan_entity` produce its raw error.
+    if !dir_has_parquet(&config.garmin_storage_path.join("daily_health")) {
+        return Err(AppError::Data(format!(
+            "Need at least {} days of data for training, but no daily health data is present. Run `model-health sync` to download data.",
+            config.min_training_days
+        )));
+    }
+
     let lf = load_daily_health(config)?;
     let df = lf.collect()?;
     let row_count = df.height();
