@@ -4,6 +4,7 @@ mod error;
 mod features;
 mod fetch;
 mod model;
+mod races;
 mod sync;
 mod validation;
 
@@ -62,6 +63,9 @@ enum Commands {
         #[arg(long, default_value = "next_day_resting_hr")]
         target: String,
     },
+    /// Race retrospective: per-race report cards plus a contrast of what
+    /// separated good races (close to PR) from bad ones in each distance bucket.
+    Races,
 }
 
 #[tokio::main]
@@ -130,6 +134,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Predict { target } => {
             model::predict(&config, &target)?;
+        }
+        Commands::Races => {
+            races::run(&config)?;
         }
     }
 
