@@ -77,24 +77,62 @@ pub struct CvResults {
 }
 
 /// Convert a Polars DataFrame into a SmartCore DenseMatrix.
+///
 /// Extracts the given feature columns as f64 and builds a row-major matrix.
-fn dataframe_to_matrix(df: &DataFrame, feature_cols: &[String]) -> Result<DenseMatrix<f64>> {
+/// Columns are looked up *once* up front (rather than per-row) and any column
+/// that isn't already Float64 is cast on the way through, so this works
+/// uniformly for the next-day model (which keeps all features f64) and the
+/// decomposition module (which has integer/derived columns mixed in).
+///
+/// `pub(crate)` so `decompose.rs` can share the same matrix builder instead
+/// of carrying its own near-duplicate.
+pub(crate) fn dataframe_to_matrix(
+    df: &DataFrame,
+    feature_cols: &[String],
+) -> Result<DenseMatrix<f64>> {
     let n_rows = df.height();
     let n_cols = feature_cols.len();
 
-    // Build row-by-row as slices for from_2d_array
-    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(n_rows);
-    for row_idx in 0..n_rows {
-        let mut row = Vec::with_capacity(n_cols);
-        for col_name in feature_cols {
+    // Pull each column once. Cast to Float64 if needed (a no-op for columns
+    // that are already f64). The intermediate `Series` values must outlive
+    // the borrowed ChunkedArrays, hence the two-vec construction.
+    let casted: Vec<Series> = feature_cols
+        .iter()
+        .map(|col_name| {
             let col = df
                 .column(col_name.as_str())
                 .map_err(|e| AppError::Model(format!("Column '{col_name}' not found: {e}")))?;
-            let ca = col
-                .f64()
-                .map_err(|e| AppError::Model(format!("Column '{col_name}' is not f64: {e}")))?;
+            let series = col
+                .as_materialized_series()
+                .cast(&DataType::Float64)
+                .map_err(|e| {
+                    AppError::Model(format!("Column '{col_name}' cast to f64 failed: {e}"))
+                })?;
+            Ok(series)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let chunkeds: Vec<&Float64Chunked> = casted
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.f64().map_err(|e| {
+                AppError::Model(format!(
+                    "Column '{}' is not f64 after cast: {e}",
+                    feature_cols[i]
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(n_rows);
+    for row_idx in 0..n_rows {
+        let mut row = Vec::with_capacity(n_cols);
+        for (col_idx, ca) in chunkeds.iter().enumerate() {
             let val = ca.get(row_idx).ok_or_else(|| {
-                AppError::Model(format!("Null value at row {row_idx}, column '{col_name}'"))
+                AppError::Model(format!(
+                    "Null value at row {row_idx}, column '{}'",
+                    feature_cols[col_idx]
+                ))
             })?;
             row.push(val);
         }
@@ -383,7 +421,10 @@ fn permutation_importance(
 /// Polars stores Date values as days-since-unix-epoch (1970-01-01),
 /// and `NaiveDate::from_num_days_from_ce_opt` wants days-since-CE, so we
 /// offset by 719_163.
-fn date_at(df: &DataFrame, row: usize) -> Result<NaiveDate> {
+///
+/// `pub(crate)` so other modules (e.g. `decompose.rs`) can share the same
+/// date-extraction logic instead of duplicating the offset.
+pub(crate) fn date_at(df: &DataFrame, row: usize) -> Result<NaiveDate> {
     let col = df.column("date")?;
     let av = col
         .get(row)

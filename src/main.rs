@@ -1,5 +1,6 @@
 mod config;
 mod data;
+mod decompose;
 mod error;
 mod features;
 mod fetch;
@@ -77,6 +78,11 @@ enum Commands {
     /// Race retrospective: per-race report cards plus a contrast of what
     /// separated good races (close to PR) from bad ones in each distance bucket.
     Races,
+    /// POC: decompose stress / RHR into training-explained vs external
+    /// (residual) components via per-target OLS regression on trailing
+    /// training-load features. Console-only — does not write any new
+    /// data files.
+    Decompose,
 }
 
 #[tokio::main]
@@ -153,6 +159,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Races => {
             races::run(&config)?;
+        }
+        Commands::Decompose => {
+            decompose::run(&config)?;
         }
     }
 
