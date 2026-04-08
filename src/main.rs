@@ -39,6 +39,17 @@ enum Commands {
         /// running.
         #[arg(long)]
         force: bool,
+        /// Restrict fetch to one or more categories. Repeat the flag to
+        /// select multiple. When omitted, all categories run (default).
+        ///
+        /// Categories:
+        ///   daily-health  per-day daily summary + performance metrics (slow)
+        ///   weight-bp     monthly weight + blood pressure (fast)
+        ///   activities    paginated activity list (fast)
+        ///
+        /// Example: `model-health fetch --from 2017-01-01 --force --only activities`
+        #[arg(long, value_enum)]
+        only: Vec<fetch::FetchCategory>,
     },
     /// Dump raw JSON from each Garmin endpoint for a single date (debugging)
     Probe {
@@ -74,8 +85,13 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::load()?;
 
     match cli.command {
-        Commands::Fetch { from, to, force } => {
-            fetch::fetch_all(&config, from, to, force).await?;
+        Commands::Fetch {
+            from,
+            to,
+            force,
+            only,
+        } => {
+            fetch::fetch_all(&config, from, to, force, &only).await?;
         }
         Commands::Probe { date } => {
             fetch::probe(date).await?;

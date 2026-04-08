@@ -12,11 +12,39 @@ use garmin_connect::Client;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
+/// Categories that `fetch_all` can run independently. The user can pass one
+/// or more on the CLI to skip the categories they don't need (the per-day
+/// daily-health loop is the slow one — over an hour for a multi-year backfill
+/// — so being able to run just `activities` for a few minutes is the main
+/// motivating use case).
+///
+/// Note: daily-health and performance-metrics share a per-day fetch loop and
+/// can't be split independently. Same for weight + blood-pressure (which
+/// share a per-month loop). Hence the bundled category names below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum FetchCategory {
+    /// Daily health summary + performance metrics (per-day loop, slow).
+    DailyHealth,
+    /// Weight + blood pressure measurements (per-month loop, fast).
+    WeightBp,
+    /// Activities (paginated list, fast). Required after editing event
+    /// types in Garmin Connect — pair with `--force` for that case.
+    Activities,
+}
+
+impl FetchCategory {
+    /// True if `selected` is empty (== "everything") or contains `self`.
+    fn is_enabled(self, selected: &[FetchCategory]) -> bool {
+        selected.is_empty() || selected.contains(&self)
+    }
+}
+
 pub async fn fetch_all(
     config: &Config,
     from: NaiveDate,
     to: Option<NaiveDate>,
     force: bool,
+    only: &[FetchCategory],
 ) -> Result<()> {
     println!("Authenticating...");
     let (_oauth1, oauth2) = crate::sync::authenticate().await?;
@@ -29,6 +57,42 @@ pub async fn fetch_all(
     let to = to.unwrap_or_else(|| Utc::now().date_naive());
     let total_days = (to - from).num_days() + 1;
 
+    if FetchCategory::DailyHealth.is_enabled(only) {
+        fetch_daily_loop(config, &client, &display_name, from, to, total_days, force).await?;
+    } else {
+        println!("Skipping daily health (not selected by --only).");
+    }
+
+    // Weight & blood pressure fetch a date *range* per call, so they use a
+    // different (month-based) incremental strategy than the per-day loop above.
+    if FetchCategory::WeightBp.is_enabled(only) {
+        fetch_weight_and_bp(config, &client, from, to, force).await?;
+    } else {
+        println!("Skipping weight & blood pressure (not selected by --only).");
+    }
+
+    // Activities are paginated (newest-first) from a single list endpoint and
+    // partitioned by ISO week.
+    if FetchCategory::Activities.is_enabled(only) {
+        fetch_activities(config, &client, from, to, force).await?;
+    } else {
+        println!("Skipping activities (not selected by --only).");
+    }
+
+    Ok(())
+}
+
+/// Per-day daily-health + performance-metrics fetch loop. Lifted out of
+/// `fetch_all` so it can be conditionally skipped via `--only`.
+async fn fetch_daily_loop(
+    config: &Config,
+    client: &Client,
+    display_name: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+    total_days: i64,
+    force: bool,
+) -> Result<()> {
     // Load existing dates so we can skip them (unless --force re-fetches all)
     let existing_health = if force {
         HashSet::new()
@@ -83,7 +147,7 @@ pub async fn fetch_all(
         } else {
             // Fetch health
             if !has_health {
-                match fetch_daily_health(&client, &display_name, date).await {
+                match fetch_daily_health(client, display_name, date).await {
                     Ok(record) => health_buf.push(record),
                     Err(e) => {
                         eprintln!("  Health {}: {}", date, e);
@@ -94,7 +158,7 @@ pub async fn fetch_all(
 
             // Fetch performance
             if !has_perf {
-                match fetch_performance(&client, &display_name, date).await {
+                match fetch_performance(client, display_name, date).await {
                     Ok(record) => perf_buf.push(record),
                     Err(e) => {
                         eprintln!("  Perf {}: {}", date, e);
@@ -140,10 +204,6 @@ pub async fn fetch_all(
         "Done. {} fetched, {} skipped, {} errors.",
         fetched, skipped, errors
     );
-
-    // Weight & blood pressure fetch a date *range* per call, so they use a
-    // different (month-based) incremental strategy than the per-day loop above.
-    fetch_weight_and_bp(config, &client, from, to, force).await?;
 
     Ok(())
 }
@@ -271,6 +331,465 @@ async fn fetch_weight_and_bp(
         total_weight_records, weight_errors, total_bp_records, bp_errors
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Activities
+// ---------------------------------------------------------------------------
+//
+// Garmin's activity list endpoint is paginated and returns activities
+// newest-first. We:
+//   1. Page through it from offset 0
+//   2. Stop when an activity's start date is older than `from`, or the page
+//      comes back empty
+//   3. Bucket activities by ISO week (matching the existing storage layout
+//      written by the previous garmin-cli writer)
+//   4. Skip weeks already on disk unless `--force` is set, but always
+//      re-fetch the *current* week (the one containing today) so newly-
+//      logged activities flow through on each run.
+//
+// Note: this is the only entity in the fetch pipeline that requires a full
+// re-fetch under `--force` to pick up *edits* — the user can re-tag an old
+// activity in Garmin Connect (e.g. set Event Type → Race) and the only way
+// for that change to land in the local parquet is via `--force`. The
+// alternative (always re-fetching every week) was rejected as too API-heavy
+// for what is, in practice, an occasional need.
+
+/// Top-level activity fetch. Pages the list endpoint, groups by ISO week,
+/// and writes one parquet partition per week through the existing
+/// `write_parquet_partition` helper.
+async fn fetch_activities(
+    config: &Config,
+    client: &Client,
+    from: NaiveDate,
+    to: NaiveDate,
+    force: bool,
+) -> Result<()> {
+    let today = Utc::now().date_naive();
+    let existing_weeks = if force {
+        HashSet::new()
+    } else {
+        load_existing_weeks(config)?
+    };
+
+    println!(
+        "Fetching activities from {} to {}{}...",
+        from,
+        to,
+        if force { " (force)" } else { "" }
+    );
+
+    // Paginate the list endpoint, stopping at the lower bound.
+    let raw = match fetch_activities_range(client, from).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  Activity fetch failed: {}", e);
+            return Ok(());
+        }
+    };
+
+    if raw.is_empty() {
+        println!("  No activities returned.");
+        return Ok(());
+    }
+
+    // Partition by ISO week derived from the activity's local start date.
+    // Activities outside [from, to] are dropped here. The paginator already
+    // stops on `from`, but `to` filtering still happens (the user can request
+    // a historical window like 2018-01..2018-12).
+    let mut by_week: std::collections::BTreeMap<(i32, u32), Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    let mut considered = 0usize;
+    let mut out_of_range = 0usize;
+    for act in raw {
+        let local = match parse_garmin_local_datetime(act.get("startTimeLocal")) {
+            Some(dt) => dt,
+            None => continue,
+        };
+        let date = local.date();
+        if date < from || date > to {
+            out_of_range += 1;
+            continue;
+        }
+        considered += 1;
+        let week = date.iso_week();
+        by_week
+            .entry((week.year(), week.week()))
+            .or_default()
+            .push(act);
+    }
+
+    println!(
+        "  Fetched {} activities in range ({} dropped as out-of-range), grouped into {} weeks.",
+        considered,
+        out_of_range,
+        by_week.len()
+    );
+
+    // Write each week's partition. Skip weeks we already have unless --force,
+    // but always rewrite the current week.
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    for ((year, week), records) in by_week {
+        let is_current = {
+            let cur = today.iso_week();
+            cur.year() == year && cur.week() == week
+        };
+        if !force && !is_current && existing_weeks.contains(&(year, week)) {
+            skipped += 1;
+            continue;
+        }
+
+        let partition = format!("{:04}-W{:02}", year, week);
+        let df = activities_records_to_df(&records)?;
+        write_parquet_partition(config, "activities", &partition, df, &["activity_id"])?;
+        written += 1;
+    }
+
+    println!(
+        "Activities: {} weeks written, {} weeks skipped (already on disk).",
+        written, skipped
+    );
+    Ok(())
+}
+
+/// Page through Garmin's activity list endpoint until either the page comes
+/// back empty or the activities returned are older than `from`. Returns the
+/// raw JSON for every activity encountered (caller filters by date range).
+///
+/// Progress tracking is done in *date space* (days walked back from today
+/// toward `from`) rather than activity count, since we don't know the total
+/// activity count up front. This lets `elapsed_and_eta` produce a meaningful
+/// ETA in the same shape as the daily-health and weight/BP loops.
+async fn fetch_activities_range(
+    client: &Client,
+    from: NaiveDate,
+) -> Result<Vec<serde_json::Value>> {
+    const PAGE_SIZE: usize = 50;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut start = 0usize;
+    let started = Instant::now();
+
+    let today = Utc::now().date_naive();
+    let total_days_back = (today - from).num_days().max(1);
+    // Track the earliest activity date seen across all pages so we can
+    // compute "how much of the requested range we've walked through".
+    let mut oldest_seen: Option<NaiveDate> = None;
+
+    loop {
+        let path = format!(
+            "/activitylist-service/activities/search/activities?start={}&limit={}",
+            start, PAGE_SIZE
+        );
+        let page: serde_json::Value = match client.get_json(&path).await {
+            Ok(v) => v,
+            Err(garmin_connect::Error::NotFound(_)) => break,
+            Err(e) => return Err(AppError::Sync(e.to_string())),
+        };
+        let arr = match page.as_array() {
+            Some(a) => a.clone(),
+            None => break,
+        };
+        if arr.is_empty() {
+            break;
+        }
+
+        // Walk the page once: update `oldest_seen` and detect whether the
+        // entire page predates `from` (which means we're done paginating).
+        let mut any_in_range = false;
+        for act in &arr {
+            let Some(dt) = parse_garmin_local_datetime(act.get("startTimeLocal")) else {
+                continue;
+            };
+            let date = dt.date();
+            if date >= from {
+                any_in_range = true;
+            }
+            oldest_seen = Some(match oldest_seen {
+                Some(prev) if prev <= date => prev,
+                _ => date,
+            });
+        }
+
+        let n = arr.len();
+        out.extend(arr);
+        start += n;
+
+        // Progress in matching shape: covered_days / total_days_back, with
+        // elapsed + ETA, plus the per-loop counters and most-recent boundary.
+        let covered_days = oldest_seen
+            .map(|d| (today - d).num_days().max(0))
+            .unwrap_or(0);
+        let (elapsed, eta) = elapsed_and_eta(started, covered_days, total_days_back);
+        let pct = if total_days_back > 0 {
+            (covered_days * 100) / total_days_back
+        } else {
+            0
+        };
+        println!(
+            "  {}/{} days back ({}%), {} activities fetched, oldest: {}  [{} elapsed, {} ETA]",
+            covered_days,
+            total_days_back,
+            pct,
+            out.len(),
+            oldest_seen
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            elapsed,
+            eta,
+        );
+
+        if !any_in_range {
+            // Every activity on this page predates `from` — stop paginating.
+            break;
+        }
+        if n < PAGE_SIZE {
+            // Short page = end of list.
+            break;
+        }
+
+        // Rate limit between pages.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Ok(out)
+}
+
+/// Build the activities DataFrame from raw API records. Mirrors the existing
+/// parquet schema (29 columns) so `vstack` in `write_or_merge_parquet` lines
+/// up correctly. Notably, populates `calories`, `avg_hr`, `max_hr` which the
+/// previous garmin-cli writer was leaving 100% null even though they're in
+/// the API response.
+fn activities_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> {
+    let mut activity_id: Vec<Option<i64>> = Vec::new();
+    let mut profile_id: Vec<Option<i32>> = Vec::new();
+    let mut activity_name: Vec<Option<String>> = Vec::new();
+    let mut activity_type: Vec<Option<String>> = Vec::new();
+    let mut start_local_us: Vec<Option<i64>> = Vec::new();
+    let mut start_gmt_us: Vec<Option<i64>> = Vec::new();
+    let mut duration_sec: Vec<Option<f64>> = Vec::new();
+    let mut distance_m: Vec<Option<f64>> = Vec::new();
+    let mut calories: Vec<Option<i32>> = Vec::new();
+    let mut avg_hr: Vec<Option<i32>> = Vec::new();
+    let mut max_hr: Vec<Option<i32>> = Vec::new();
+    let mut avg_speed: Vec<Option<f64>> = Vec::new();
+    let mut max_speed: Vec<Option<f64>> = Vec::new();
+    let mut elevation_gain: Vec<Option<f64>> = Vec::new();
+    let mut elevation_loss: Vec<Option<f64>> = Vec::new();
+    let mut avg_cadence: Vec<Option<f64>> = Vec::new();
+    let mut avg_power: Vec<Option<i32>> = Vec::new();
+    let mut normalized_power: Vec<Option<i32>> = Vec::new();
+    let mut training_effect: Vec<Option<f64>> = Vec::new();
+    let mut training_load: Vec<Option<f64>> = Vec::new();
+    let mut start_lat: Vec<Option<f64>> = Vec::new();
+    let mut start_lon: Vec<Option<f64>> = Vec::new();
+    let mut end_lat: Vec<Option<f64>> = Vec::new();
+    let mut end_lon: Vec<Option<f64>> = Vec::new();
+    let mut ground_contact_time: Vec<Option<f64>> = Vec::new();
+    let mut vertical_oscillation: Vec<Option<f64>> = Vec::new();
+    let mut stride_length: Vec<Option<f64>> = Vec::new();
+    let mut location_name: Vec<Option<String>> = Vec::new();
+    let mut raw_json: Vec<Option<String>> = Vec::new();
+
+    for r in records {
+        activity_id.push(r.get("activityId").and_then(|v| v.as_i64()));
+        // profile_id is constant 2 across all 1517 existing rows for this user;
+        // hard-code it to keep the schema stable. The field doesn't appear in
+        // the activity list response under any obvious key.
+        profile_id.push(Some(2));
+        activity_name.push(
+            r.get("activityName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        );
+        activity_type.push(
+            r.get("activityType")
+                .and_then(|v| v.get("typeKey"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        );
+        start_local_us.push(
+            parse_garmin_local_datetime(r.get("startTimeLocal"))
+                .map(|dt| dt.and_utc().timestamp_micros()),
+        );
+        start_gmt_us.push(
+            parse_garmin_local_datetime(r.get("startTimeGMT"))
+                .map(|dt| dt.and_utc().timestamp_micros()),
+        );
+        duration_sec.push(r.get("duration").and_then(|v| v.as_f64()));
+        distance_m.push(r.get("distance").and_then(|v| v.as_f64()));
+        // calories/HR were 100% null in the previous writer but are in raw_json.
+        calories.push(jf32_to_i32(r, "calories"));
+        avg_hr.push(jf32_to_i32(r, "averageHR"));
+        max_hr.push(jf32_to_i32(r, "maxHR"));
+        avg_speed.push(r.get("averageSpeed").and_then(|v| v.as_f64()));
+        max_speed.push(r.get("maxSpeed").and_then(|v| v.as_f64()));
+        elevation_gain.push(r.get("elevationGain").and_then(|v| v.as_f64()));
+        elevation_loss.push(r.get("elevationLoss").and_then(|v| v.as_f64()));
+        // Garmin uses different cadence keys per sport; try the running one,
+        // then fall back to biking. The double-precision (`maxDoubleCadence`)
+        // variant is for max only — we want the average, so we don't need it.
+        avg_cadence.push(
+            r.get("averageRunningCadenceInStepsPerMinute")
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    r.get("averageBikingCadenceInRevsPerMinute")
+                        .and_then(|v| v.as_f64())
+                }),
+        );
+        avg_power.push(jf32_to_i32(r, "avgPower"));
+        normalized_power.push(jf32_to_i32(r, "normPower"));
+        training_effect.push(r.get("aerobicTrainingEffect").and_then(|v| v.as_f64()));
+        training_load.push(r.get("activityTrainingLoad").and_then(|v| v.as_f64()));
+        start_lat.push(r.get("startLatitude").and_then(|v| v.as_f64()));
+        start_lon.push(r.get("startLongitude").and_then(|v| v.as_f64()));
+        end_lat.push(r.get("endLatitude").and_then(|v| v.as_f64()));
+        end_lon.push(r.get("endLongitude").and_then(|v| v.as_f64()));
+        ground_contact_time.push(r.get("avgGroundContactTime").and_then(|v| v.as_f64()));
+        vertical_oscillation.push(r.get("avgVerticalOscillation").and_then(|v| v.as_f64()));
+        stride_length.push(r.get("avgStrideLength").and_then(|v| v.as_f64()));
+        location_name.push(
+            r.get("locationName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        );
+        // Preserve the original JSON exactly so race-tag detection
+        // (`eventType.typeKey == "race"`) keeps working from the parquet.
+        raw_json.push(serde_json::to_string(r).ok());
+    }
+
+    // Build datetime[μs] series explicitly so the dtype matches the existing
+    // parquet (the df! macro defaults to nanoseconds, which would break
+    // vstack on merge).
+    let local_series =
+        Int64Chunked::from_iter_options("start_time_local".into(), start_local_us.into_iter())
+            .into_datetime(TimeUnit::Microseconds, None)
+            .into_series();
+    let gmt_series =
+        Int64Chunked::from_iter_options("start_time_gmt".into(), start_gmt_us.into_iter())
+            .into_datetime(TimeUnit::Microseconds, None)
+            .into_series();
+
+    let df = df!(
+        "activity_id" => &activity_id,
+        "profile_id" => &profile_id,
+        "activity_name" => &activity_name,
+        "activity_type" => &activity_type,
+        "duration_sec" => &duration_sec,
+        "distance_m" => &distance_m,
+        "calories" => &calories,
+        "avg_hr" => &avg_hr,
+        "max_hr" => &max_hr,
+        "avg_speed" => &avg_speed,
+        "max_speed" => &max_speed,
+        "elevation_gain" => &elevation_gain,
+        "elevation_loss" => &elevation_loss,
+        "avg_cadence" => &avg_cadence,
+        "avg_power" => &avg_power,
+        "normalized_power" => &normalized_power,
+        "training_effect" => &training_effect,
+        "training_load" => &training_load,
+        "start_lat" => &start_lat,
+        "start_lon" => &start_lon,
+        "end_lat" => &end_lat,
+        "end_lon" => &end_lon,
+        "ground_contact_time" => &ground_contact_time,
+        "vertical_oscillation" => &vertical_oscillation,
+        "stride_length" => &stride_length,
+        "location_name" => &location_name,
+        "raw_json" => &raw_json,
+    )?;
+
+    // Append the two datetime columns and reorder to match the existing schema.
+    let mut df = df;
+    df.with_column(local_series)?;
+    df.with_column(gmt_series)?;
+    let ordered = df.select([
+        "activity_id",
+        "profile_id",
+        "activity_name",
+        "activity_type",
+        "start_time_local",
+        "start_time_gmt",
+        "duration_sec",
+        "distance_m",
+        "calories",
+        "avg_hr",
+        "max_hr",
+        "avg_speed",
+        "max_speed",
+        "elevation_gain",
+        "elevation_loss",
+        "avg_cadence",
+        "avg_power",
+        "normalized_power",
+        "training_effect",
+        "training_load",
+        "start_lat",
+        "start_lon",
+        "end_lat",
+        "end_lon",
+        "ground_contact_time",
+        "vertical_oscillation",
+        "stride_length",
+        "location_name",
+        "raw_json",
+    ])?;
+
+    Ok(ordered)
+}
+
+/// List the ISO weeks already represented as `activities/YYYY-Wnn.parquet`
+/// files on disk.
+fn load_existing_weeks(config: &Config) -> Result<HashSet<(i32, u32)>> {
+    let dir = config.garmin_storage_path.join("activities");
+    let mut set = HashSet::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(set),
+        Err(e) => {
+            tracing::warn!(
+                "load_existing_weeks: cannot read {}: {} — proceeding as if empty",
+                dir.display(),
+                e
+            );
+            return Ok(set);
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Expect "YYYY-Wnn"
+        if stem.len() == 8
+            && &stem.as_bytes()[4..6] == b"-W"
+            && let (Ok(y), Ok(w)) = (stem[..4].parse::<i32>(), stem[6..].parse::<u32>())
+        {
+            set.insert((y, w));
+        }
+    }
+    Ok(set)
+}
+
+/// Parse a Garmin "YYYY-MM-DD HH:MM:SS" string (used for both startTimeLocal
+/// and startTimeGMT) into a NaiveDateTime. Returns None on missing/malformed
+/// input — caller treats that as "skip this activity".
+fn parse_garmin_local_datetime(v: Option<&serde_json::Value>) -> Option<chrono::NaiveDateTime> {
+    let s = v.and_then(|v| v.as_str())?;
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+}
+
+/// Garmin's activity list returns numeric fields (calories, HR) as f64 even
+/// when they're conceptually integers. Convert to Option<i32> via the i64
+/// rounding path so we don't lose values that happen to be whole.
+fn jf32_to_i32(v: &serde_json::Value, key: &str) -> Option<i32> {
+    v.get(key)
+        .and_then(|v| v.as_f64())
+        .map(|f| f.round() as i32)
 }
 
 /// Iterate (year, month) tuples covering the inclusive [from, to] range.
