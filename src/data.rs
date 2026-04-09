@@ -84,6 +84,22 @@ pub fn load_decomposed_health(config: &Config) -> Result<LazyFrame> {
         .map_err(|e| AppError::Data(format!("Failed to scan decomposed_health.parquet: {e}")))
 }
 
+/// Activity types classified as "running" for volume / load calculations.
+/// Shared across modules so that injury-risk, decompose, and race analysis
+/// agree on what counts as a run.
+pub const RUNNING_TYPES: &[&str] = &["running", "treadmill_running", "virtual_run"];
+
+/// Build an `activity_type IN (...)` filter expression from a slice of type
+/// strings. Uses an OR-chain because Polars `is_in` behaviour varies across
+/// versions.
+pub fn type_in_list(types: &[&str]) -> Expr {
+    types
+        .iter()
+        .map(|t| col("activity_type").eq(lit(*t)))
+        .reduce(|a, b| a.or(b))
+        .expect("types must be non-empty")
+}
+
 /// Filter a LazyFrame by date range.
 #[allow(dead_code)]
 pub fn filter_date_range(

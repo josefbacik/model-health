@@ -4,6 +4,7 @@ mod decompose;
 mod error;
 mod features;
 mod fetch;
+mod injury_risk;
 mod model;
 mod races;
 mod sync;
@@ -83,6 +84,10 @@ enum Commands {
     /// training-load features. Console-only — does not write any new
     /// data files.
     Decompose,
+    /// Injury risk assessment: shows recent training load and physiological
+    /// signals with a tiered warning system (red / yellow / volume) based on
+    /// historical injury-gap analysis.
+    InjuryRisk,
 }
 
 #[tokio::main]
@@ -162,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Decompose => {
             decompose::run(&config)?;
+        }
+        Commands::InjuryRisk => {
+            injury_risk::run(&config)?;
         }
     }
 

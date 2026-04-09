@@ -126,10 +126,8 @@ const FEATURES: &[&str] = &[
     "sleep_hours_prior_7d",
 ];
 
-/// Running activity types — used for the per-day distance aggregation. The
-/// list matches `races.rs::RUNNING_TYPES` and is the user's dominant
-/// training mode.
-const RUNNING_TYPES: &[&str] = &["running", "treadmill_running", "virtual_run"];
+// Running types come from the shared constant in `data.rs`.
+use crate::data::RUNNING_TYPES;
 
 /// Non-running endurance activity types whose distance contributes to the
 /// "cross-training" signal. We deliberately exclude strength_training (no
@@ -241,8 +239,8 @@ fn aggregate_activities_per_day(lf: LazyFrame) -> Result<DataFrame> {
     // Build a per-row classification: is this run, cross-train, or other?
     // Then group by date and sum each category separately. Doing it as a
     // single group_by is faster than two separate filtered groups.
-    let is_run = type_in_list(RUNNING_TYPES);
-    let is_cross = type_in_list(CROSS_TRAIN_TYPES);
+    let is_run = data::type_in_list(RUNNING_TYPES);
+    let is_cross = data::type_in_list(CROSS_TRAIN_TYPES);
     let dist_km = col("distance_m").cast(DataType::Float64) / lit(1000.0);
 
     let df = lf
@@ -268,17 +266,6 @@ fn aggregate_activities_per_day(lf: LazyFrame) -> Result<DataFrame> {
         .collect()?;
 
     Ok(df)
-}
-
-/// Build an `activity_type IN (...)` filter over a const list of type strings.
-/// Polars `is_in` requires a feature flag we don't currently enable, so we
-/// build an OR-chain instead — matches the pattern used in `races.rs`.
-fn type_in_list(types: &[&str]) -> Expr {
-    types
-        .iter()
-        .map(|t| col("activity_type").eq(lit(*t)))
-        .reduce(|a, b| a.or(b))
-        .expect("types must be non-empty")
 }
 
 /// Build features for one target and fit OLS. Returns `Some(TargetFit)` on

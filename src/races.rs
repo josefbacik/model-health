@@ -151,8 +151,8 @@ fn fmt_time(sec: f64) -> String {
 // Race loader
 // ---------------------------------------------------------------------------
 
-/// Activity types we treat as runs eligible to be races.
-const RUNNING_TYPES: &[&str] = &["running", "treadmill_running", "virtual_run"];
+// Running types come from the shared constant in `data.rs`.
+use crate::data::RUNNING_TYPES;
 
 /// Load all races from the activities parquet. A race is any running activity
 /// whose raw_json `eventType.typeKey == "race"` and whose distance falls into
@@ -424,18 +424,8 @@ impl DataBundle {
 /// `duration_sec`.
 fn filter_runs_with_date(activities: &DataFrame) -> Result<DataFrame> {
     let lf = activities.clone().lazy();
-    // Build the filter from the same RUNNING_TYPES constant the race loader
-    // uses, so the two stay in sync if we ever add e.g. "track_running".
-    // Polars `is_in` is awkward across versions; OR-chain over the constant
-    // is simple and version-stable.
-    let type_filter = RUNNING_TYPES
-        .iter()
-        .map(|t| col("activity_type").eq(lit(*t)))
-        .reduce(|a, b| a.or(b))
-        .expect("RUNNING_TYPES must be non-empty");
-
     let df = lf
-        .filter(type_filter)
+        .filter(data::type_in_list(RUNNING_TYPES))
         .with_columns([
             col("start_time_local").dt().date().alias("date"),
             (col("distance_m").cast(DataType::Float64) / lit(1000.0)).alias("distance_km"),
