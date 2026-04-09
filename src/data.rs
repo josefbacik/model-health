@@ -67,6 +67,23 @@ pub fn load_blood_pressure(config: &Config) -> Result<LazyFrame> {
     scan_entity(&config.garmin_storage_path, "blood_pressure")
 }
 
+/// Load the decomposed-health parquet (output of `model-health decompose`).
+/// Lives under `data_dir` rather than `garmin_storage_path` because it's
+/// derived from raw data, not fetched. Returns an error if the file doesn't
+/// exist — callers that want optional behavior should handle the error.
+pub fn load_decomposed_health(config: &Config) -> Result<LazyFrame> {
+    let path = config.data_dir.join("decomposed_health.parquet");
+    if !path.exists() {
+        return Err(AppError::Data(format!(
+            "decomposed_health.parquet not found at {}. Run `model-health decompose` first.",
+            path.display()
+        )));
+    }
+    let pattern = path.to_string_lossy().to_string();
+    LazyFrame::scan_parquet(&pattern, Default::default())
+        .map_err(|e| AppError::Data(format!("Failed to scan decomposed_health.parquet: {e}")))
+}
+
 /// Filter a LazyFrame by date range.
 #[allow(dead_code)]
 pub fn filter_date_range(

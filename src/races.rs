@@ -298,6 +298,19 @@ const FEATURE_NAMES: &[&str] = &[
     "stress_28d",
     "stress_12w",
     "high_stress_days_28d_pct",
+    // --- decomposed stress (only present if `model-health decompose` has run) ---
+    // stress_external_* = the residual of measured stress that the OLS
+    // decomposition could NOT explain from training+sleep — interpret as
+    // "life stress" leaking through. stress_training_* = the part the
+    // decomposition DID explain from training/sleep features. Looking at
+    // these alongside the raw stress columns is what the whole decomposition
+    // exercise was for.
+    "stress_external_7d",
+    "stress_external_28d",
+    "stress_training_7d",
+    "stress_training_28d",
+    "rhr_external_7d",
+    "rhr_external_28d",
     // --- training volume ---
     "mileage_4w_km",
     "mileage_8w_km",
@@ -336,10 +349,11 @@ pub type FeatureMap = BTreeMap<String, Option<f64>>;
 /// Bundled, pre-collected DataFrames used by per-race feature computation.
 /// Loading these once and reusing across races avoids re-scanning parquet.
 struct DataBundle {
-    runs: DataFrame,           // running activities only, with date + distance_km
-    daily: Option<DataFrame>,  // daily_health, cleaned
-    perf: Option<DataFrame>,   // performance_metrics
-    weight: Option<DataFrame>, // weight entries
+    runs: DataFrame,               // running activities only, with date + distance_km
+    daily: Option<DataFrame>,      // daily_health, cleaned
+    perf: Option<DataFrame>,       // performance_metrics
+    weight: Option<DataFrame>,     // weight entries
+    decomposed: Option<DataFrame>, // decomposed_health (output of `model-health decompose`)
 }
 
 impl DataBundle {
@@ -378,11 +392,29 @@ impl DataBundle {
             Err(_) => None,
         };
 
+        // --- Decomposed health (optional — only present after `decompose`) -
+        let decomposed = match data::load_decomposed_health(config) {
+            Ok(lf) => match lf.sort(["date"], Default::default()).collect() {
+                Ok(df) => Some(df),
+                Err(e) => {
+                    warn!(error = %e, "Could not collect decomposed_health for race features");
+                    None
+                }
+            },
+            Err(e) => {
+                // Not an error — just means the user hasn't run `decompose` yet.
+                // The corresponding race features will be `None` in the table.
+                info!(reason = %e, "Skipping decomposed_health features (file not present)");
+                None
+            }
+        };
+
         Ok(Self {
             runs,
             daily,
             perf,
             weight,
+            decomposed,
         })
     }
 }
@@ -697,6 +729,38 @@ fn compute_race_features(bundle: &DataBundle, race: &Race) -> FeatureMap {
         feats.insert(
             "hrv_unbalanced_days_28d_pct".into(),
             window_fraction_status_in(daily, "hrv_status", &["UNBALANCED", "LOW"], d4w, day_before),
+        );
+    }
+
+    // --- Decomposed stress / RHR (only present if `decompose` has run) -
+    // The columns in the decomposed parquet are named `stress`,
+    // `stress_predicted`, `stress_external`, `rhr`, `rhr_predicted`,
+    // `rhr_external`. Race retro features prefix the *target* (stress/rhr)
+    // and suffix with the window: `stress_external_28d`, etc.
+    if let Some(decomposed) = bundle.decomposed.as_ref() {
+        feats.insert(
+            "stress_external_7d".into(),
+            window_mean(decomposed, "stress_external", d1w, day_before),
+        );
+        feats.insert(
+            "stress_external_28d".into(),
+            window_mean(decomposed, "stress_external", d4w, day_before),
+        );
+        feats.insert(
+            "stress_training_7d".into(),
+            window_mean(decomposed, "stress_predicted", d1w, day_before),
+        );
+        feats.insert(
+            "stress_training_28d".into(),
+            window_mean(decomposed, "stress_predicted", d4w, day_before),
+        );
+        feats.insert(
+            "rhr_external_7d".into(),
+            window_mean(decomposed, "rhr_external", d1w, day_before),
+        );
+        feats.insert(
+            "rhr_external_28d".into(),
+            window_mean(decomposed, "rhr_external", d4w, day_before),
         );
     }
 

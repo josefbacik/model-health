@@ -16,15 +16,52 @@
 //! (say >0.15), the residual is a real lower bound on "non-training-driven
 //! variation" and worth feeding into race retros.
 
+use std::path::PathBuf;
+
 use polars::prelude::*;
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linear::linear_regression::LinearRegression;
+use tracing::info;
 
 use crate::config::Config;
 use crate::data;
 use crate::error::{AppError, Result};
 use crate::model;
 use crate::validation;
+
+/// One target's complete fit: the cleaned input frame, the actual values,
+/// the OLS predictions, and the residuals. Carried out of `fit_target` so
+/// that `print_target_report` can render the report and `save_decomposed`
+/// can persist per-day predictions/residuals to parquet.
+struct TargetFit {
+    /// Garmin column name being decomposed (e.g. "avg_stress").
+    target_col: String,
+    /// Short label used in reports and parquet column prefixes ("stress").
+    label: String,
+    /// The cleaned, drop-nullsed feature DataFrame the OLS was fit on.
+    /// Carries the `date` column so per-row predictions can be joined
+    /// back to a date axis when persisting.
+    clean: DataFrame,
+    /// Target values (length == clean.height()).
+    y: Vec<f64>,
+    /// OLS predictions on `clean` (same length as `y`).
+    preds: Vec<f64>,
+    /// Residuals = y - preds.
+    residuals: Vec<f64>,
+    /// Coefficients in the same order as FEATURES.
+    coefficients: Vec<f64>,
+    /// OLS intercept.
+    intercept: f64,
+    /// Pre-drop / post-drop row counts, for the printed report.
+    pre_drop_rows: usize,
+    /// Coefficient of determination on the training set.
+    r_squared: f64,
+    /// MAE of residuals.
+    mae: f64,
+    /// Most-positive and most-negative residuals.
+    max_pos_residual: f64,
+    max_neg_residual: f64,
+}
 
 /// Targets to decompose. Tuple is (column name in daily_health, short label,
 /// signal-baseline rolling window in days).
@@ -134,9 +171,16 @@ pub fn run(config: &Config) -> Result<()> {
     );
 
     // --- Fit + report per target ---------------------------------------
+    let mut fits: Vec<TargetFit> = Vec::new();
     for (target_col, label, baseline_days) in TARGETS {
-        match decompose_target(&joined, target_col, label, *baseline_days) {
-            Ok(()) => {}
+        match fit_target(&joined, target_col, label, *baseline_days) {
+            Ok(Some(fit)) => {
+                print_target_report(&fit);
+                fits.push(fit);
+            }
+            Ok(None) => {
+                // Too few rows; the fit_target body printed why.
+            }
             Err(e) => {
                 println!("--- {label} ({target_col}) ---");
                 println!("  Failed: {e}\n");
@@ -144,7 +188,23 @@ pub fn run(config: &Config) -> Result<()> {
         }
     }
 
+    // --- Persist per-day predictions + residuals to parquet -----------
+    if fits.is_empty() {
+        println!("No targets fit successfully — nothing to save.");
+    } else {
+        let path = decomposed_health_path(config);
+        save_decomposed(&fits, &path)?;
+        println!("Saved decomposed_health.parquet to {}", path.display());
+    }
+
     Ok(())
+}
+
+/// Path to the parquet that holds per-day predictions and residuals. Lives
+/// under `data_dir` rather than `garmin_storage_path` because it's *derived*
+/// from raw data, not fetched.
+fn decomposed_health_path(config: &Config) -> PathBuf {
+    config.data_dir.join("decomposed_health.parquet")
 }
 
 /// Group activities by local date and produce per-day load columns:
@@ -198,16 +258,19 @@ fn type_in_list(types: &[&str]) -> Expr {
         .expect("types must be non-empty")
 }
 
-/// Build features for one target, fit OLS, and print the report. The
-/// `baseline_days` argument controls the rolling-mean window for the
-/// `signal_baseline` autoregressive feature; it's per-target because HRV
-/// data is too short for a 90-day window.
-fn decompose_target(
+/// Build features for one target and fit OLS. Returns `Some(TargetFit)` on
+/// success or `None` if there are too few rows for a stable fit (in which
+/// case the function has already printed the "skipping" message).
+///
+/// Doing the fit here without printing lets `run` collect every successful
+/// fit so they can be persisted to a single parquet, while keeping the
+/// printed report driven by `print_target_report` from the same struct.
+fn fit_target(
     joined: &DataFrame,
     target_col: &str,
     label: &str,
     baseline_days: usize,
-) -> Result<()> {
+) -> Result<Option<TargetFit>> {
     // Distance rolling sums use the full window (input is 0-filled on rest
     // days, so there are no input nulls — strict min_periods is fine).
     let rolling_7d_strict = RollingOptionsFixedWindow {
@@ -285,16 +348,18 @@ fn decompose_target(
     let clean = with_features.lazy().drop_nulls(Some(required)).collect()?;
 
     let n = clean.height();
-    let dropped = pre_drop_rows.saturating_sub(n);
-    println!("--- {label} ({target_col}) ---");
-    println!("  Rows: {n} fit  ({dropped} dropped from {pre_drop_rows} for null target/features)");
     // Hard-coded floor for stable OLS — 100 rows × 8 features is ~12
     // observations per feature, the conventional rule of thumb. The
     // existing config.min_training_days (60) is for the next-day model
     // and isn't strict enough for this fit, so the threshold lives here.
     if n < 100 {
+        println!("--- {label} ({target_col}) ---");
+        let dropped = pre_drop_rows.saturating_sub(n);
+        println!(
+            "  Rows: {n} fit  ({dropped} dropped from {pre_drop_rows} for null target/features)"
+        );
         println!("  Not enough rows for stable decomposition (need ≥100). Skipping.\n");
-        return Ok(());
+        return Ok(None);
     }
 
     // Build (X, y) via the shared matrix builder in model.rs. Allocates a
@@ -338,29 +403,145 @@ fn decompose_target(
     let max_pos = residuals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let max_neg = residuals.iter().copied().fold(f64::INFINITY, f64::min);
 
+    // Pull coefficients out of the smartcore model into a Vec so the
+    // TargetFit doesn't borrow from a model owned by this stack frame.
+    let coefs_matrix = model.coefficients();
+    let coefficients: Vec<f64> = (0..FEATURES.len())
+        .map(|i| *coefs_matrix.get((i, 0)))
+        .collect();
+    let intercept = *model.intercept();
+
+    Ok(Some(TargetFit {
+        target_col: target_col.to_string(),
+        label: label.to_string(),
+        clean,
+        y,
+        preds,
+        residuals,
+        coefficients,
+        intercept,
+        pre_drop_rows,
+        r_squared,
+        mae,
+        max_pos_residual: max_pos,
+        max_neg_residual: max_neg,
+    }))
+}
+
+/// Render the per-target report from a completed fit. Pulled out of
+/// `fit_target` so the same struct can drive both the printed report and
+/// the parquet save.
+fn print_target_report(fit: &TargetFit) {
+    let n = fit.y.len();
+    let dropped = fit.pre_drop_rows.saturating_sub(n);
+    let mean_y = fit.y.iter().sum::<f64>() / n as f64;
+
+    println!("--- {} ({}) ---", fit.label, fit.target_col);
+    println!(
+        "  Rows: {n} fit  ({dropped} dropped from {} for null target/features)",
+        fit.pre_drop_rows
+    );
     println!(
         "  R²:              {:.3}  ({:.0}% of variance explained by training inputs)",
-        r_squared,
-        r_squared * 100.0
+        fit.r_squared,
+        fit.r_squared * 100.0
     );
     println!("  Target mean:     {mean_y:.2}");
-    println!("  Residual MAE:    {mae:.2}");
-    println!("  Residual range:  {max_neg:+.2} to {max_pos:+.2}");
-    println!("  Intercept:       {:>+10.4}", *model.intercept());
+    println!("  Residual MAE:    {:.2}", fit.mae);
+    println!(
+        "  Residual range:  {:+.2} to {:+.2}",
+        fit.max_neg_residual, fit.max_pos_residual
+    );
+    println!("  Intercept:       {:>+10.4}", fit.intercept);
     println!("  Coefficients (target units per unit feature):");
-    let coefs = model.coefficients();
-    for (i, feat) in FEATURES.iter().enumerate() {
-        let v = *coefs.get((i, 0));
+    for (feat, v) in FEATURES.iter().zip(fit.coefficients.iter()) {
         println!("    {feat:<22} {v:>+10.4}");
     }
-
-    // Top 10 highest residual days = largest unexplained-by-training values.
-    // For stress/RHR these are days where the signal was *higher* than
-    // training would predict — interpretation: external factor (life,
-    // illness, weather) pushed it up.
-    print_top_residuals(&clean, &y, &residuals, 10);
+    print_top_residuals(&fit.clean, &fit.y, &fit.residuals, 10);
     println!();
+}
+
+/// Persist per-day actual / predicted / residual values for every successful
+/// target fit to a single parquet file. Per-target columns are named with the
+/// short label as a prefix:
+///
+///   date | stress | stress_predicted | stress_external | rhr | rhr_predicted | rhr_external
+///
+/// Different targets may have different fit row sets (drop_nulls drops on
+/// per-target features) so the per-fit frames are full-outer-joined on `date`.
+/// Days that one target couldn't fit get null in that target's columns.
+fn save_decomposed(fits: &[TargetFit], path: &std::path::Path) -> Result<()> {
+    if fits.is_empty() {
+        return Err(AppError::Model(
+            "save_decomposed called with no fits".into(),
+        ));
+    }
+
+    // Build one (date, actual, predicted, external) DataFrame per target.
+    let per_target: Vec<DataFrame> = fits
+        .iter()
+        .map(build_per_fit_frame)
+        .collect::<Result<Vec<_>>>()?;
+
+    // Full-outer-join them all on `date`. Start with the first frame; outer-
+    // join each subsequent one. Polars outer joins produce a `date_right`
+    // column that we coalesce into `date` after each step.
+    let mut joined = per_target[0].clone().lazy();
+    for next in per_target.iter().skip(1) {
+        joined = joined.join(
+            next.clone().lazy(),
+            [col("date")],
+            [col("date")],
+            JoinArgs::new(JoinType::Full).with_coalesce(JoinCoalesce::CoalesceColumns),
+        );
+    }
+    let mut combined = joined.sort(["date"], Default::default()).collect()?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Atomic write via .tmp + rename — same pattern as the fetcher.
+    let tmp = path.with_extension("parquet.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .finish(&mut combined)?;
+    }
+    std::fs::rename(&tmp, path)?;
+
+    info!(
+        rows = combined.height(),
+        targets = fits.len(),
+        path = %path.display(),
+        "Wrote decomposed_health.parquet"
+    );
     Ok(())
+}
+
+/// Build the per-target slice of the decomposed parquet: a DataFrame with
+/// columns `date`, `{label}`, `{label}_predicted`, `{label}_external`.
+fn build_per_fit_frame(fit: &TargetFit) -> Result<DataFrame> {
+    // Extract the date column as a Series and clone it; everything else is
+    // built from the parallel y / preds / residuals Vecs.
+    let date_series = fit.clean.column("date")?.clone();
+
+    let actual_name = fit.label.clone();
+    let predicted_name = format!("{}_predicted", fit.label);
+    let external_name = format!("{}_external", fit.label);
+
+    let actual = Series::new(actual_name.as_str().into(), &fit.y);
+    let predicted = Series::new(predicted_name.as_str().into(), &fit.preds);
+    let external = Series::new(external_name.as_str().into(), &fit.residuals);
+
+    DataFrame::new(vec![
+        date_series,
+        actual.into(),
+        predicted.into(),
+        external.into(),
+    ])
+    .map_err(|e| AppError::Model(format!("build_per_fit_frame for {}: {e}", fit.label)))
 }
 
 /// Print the top-`n` highest residual days. These are the days where the
