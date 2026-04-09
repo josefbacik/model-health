@@ -10,9 +10,7 @@
 //! computes per-race trailing-window features like `stress_external_28d`
 //! (mean of the stress residual over the 28 days before a race). This
 //! lets the race retro separate "stress from training" from "stress from
-//! life" when comparing good vs bad races — subject to the known
-//! limitation that the linear model can't cleanly decompose the marathon-PR
-//! outlier (see `plans/stress-decomposition.md` for details).
+//! life" when comparing good vs bad races.
 //!
 //! HRV was tried as a third target during POC iteration and dropped — see
 //! the comment on `TARGETS` for why.
@@ -75,37 +73,47 @@ struct TargetFit {
 /// gaps. Conclusion: HRV doesn't have enough data for a clean decomposition,
 /// and sleep — the only feature that actually moved HRV — can be inspected
 /// directly via the race retro's raw HRV features.
-const TARGETS: &[(&str, &str, usize)] = &[("avg_stress", "stress", 90), ("resting_hr", "rhr", 90)];
+const TARGETS: &[(&str, &str)] = &[("avg_stress", "stress"), ("resting_hr", "rhr")];
 
 /// Per-day features. Order drives the printed coefficient table.
 ///
 /// History: v1 included `distance_lag2_km` / `distance_lag3_km` (collinear
 /// with distance_7d_km, sign-flipped). v2 added cross-training, sleep,
 /// Garmin's `training_load`, and dropped lag2/lag3. v3 dropped
-/// `distance_lag1_km` and `training_load_today/7d`. v4 (this version) adds
-/// `acwr_7d_28d` — the acute:chronic workload ratio — to capture the
-/// physiological adaptation effect that purely additive distance features
-/// can't express: the same absolute training load is much less stressful
-/// when the body has been adapted to it (high chronic baseline) than when
-/// it's a sudden ramp-up (low chronic baseline). Without an interaction
-/// feature like this, the model attributes adapted-load stress to "external"
-/// residual, which mis-decomposes high-volume training cycles like marathon
-/// PR builds.
+/// `distance_lag1_km` and `training_load_today/7d`. v4 tried ACWR (both
+/// 7d/28d and 28d/90d) but it was collinear with the component distance
+/// features and sign-flipped. v5 (this version) replaces `signal_baseline`
+/// (90-day rolling mean of the target signal) with `distance_90d_km`
+/// (90-day rolling sum of running distance) and adds `distance_7d_km_sq`
+/// for non-linear acute-load response. signal_baseline mixed training and
+/// life stress indistinguishably — its 0.85 coefficient dominated the
+/// model and caused it to attribute Vancouver's life stress to "training"
+/// (hiding it in a negative residual). The distance-based baseline ties
+/// the slow-drift proxy purely to training volume, so the residual now
+/// correctly identifies high-life-stress periods (Vancouver: +5.7,
+/// Richmond: +5.3) vs low-life-stress periods (Cary PR: +2.1).
 const FEATURES: &[&str] = &[
-    // Running distance: today + short/medium rolling sums.
+    // Running distance: today + short/medium/long rolling sums.
     //
-    // A 90-day sum and an acute:chronic workload ratio (ACWR) were tried
-    // in v4-v5 and dropped. The 90-day sum was structurally redundant with
-    // `signal_baseline` (90-day rolling mean of the target itself), which
-    // already absorbs slow training-volume drift. ACWR (both 7d/28d and
-    // 28d/90d timescales) was collinear with the component distance
-    // features and produced sign-flipped coefficients. Neither improved
-    // R² meaningfully or fixed the marathon-PR residual sign issue, which
-    // appears to be a fundamental limitation of the linear approach when
-    // one race has 3× the training volume of the others.
+    // `distance_7d_km_sq` captures the non-linear acute-load effect: a big
+    // week (80 km) produces ~8.6 more stress points than a normal week
+    // (40 km) beyond what the linear term predicts. `distance_28d_km_sq`
+    // was tried and dropped — its coefficient was ~0, negligible at any
+    // realistic 4-week volume.
+    //
+    // `distance_90d_km` replaces the old `signal_baseline` (90-day rolling
+    // mean of the target signal itself). signal_baseline absorbed slow drift
+    // from BOTH training and life stress, so the model couldn't distinguish
+    // them — e.g. Vancouver's elevated life stress inflated the baseline,
+    // causing the model to over-predict training stress and hide the life
+    // stress in a negative residual. Using a 90-day distance sum instead
+    // ties the baseline proxy to training volume only, so the residual
+    // reflects genuine non-training variation.
     "distance_today_km",
     "distance_7d_km",
     "distance_28d_km",
+    "distance_7d_km_sq",
+    "distance_90d_km",
     // Cross-training (cycling, swimming, etc.).
     "cross_train_today_km",
     "cross_train_7d_km",
@@ -116,8 +124,6 @@ const FEATURES: &[&str] = &[
     // distance_7d_km is kept orthogonal to distance_today_km.
     "sleep_hours_last_night",
     "sleep_hours_prior_7d",
-    // Slow-moving baseline of the target itself, lagged 1 day.
-    "signal_baseline",
 ];
 
 /// Running activity types — used for the per-day distance aggregation. The
@@ -141,12 +147,12 @@ const CROSS_TRAIN_TYPES: &[&str] = &[
 
 /// POC entry point. Loads data, fits OLS for each target, prints reports.
 pub fn run(config: &Config) -> Result<()> {
-    println!("=== Stress / RHR decomposition (POC) ===\n");
+    println!("=== Stress / RHR decomposition ===\n");
     println!(
-        "Fitting an OLS linear regression for each target signal. Features:\n\
-         running distance (today + 7d/28d rolling sums), cross-training distance\n\
-         (today + 7d), sleep hours (last night + 7d mean), and a 90-day rolling\n\
-         mean of the signal itself as a slow-moving baseline.\n\n\
+        "Fitting an OLS regression for each target signal. Features:\n\
+         running distance (today + 7d/28d/90d rolling sums + squared terms for\n\
+         non-linear volume response), cross-training distance (today + 7d),\n\
+         and sleep hours (last night + 7d mean).\n\n\
          The residual = actual - predicted is the part of the signal that training\n\
          and sleep inputs cannot explain — interpret as a lower bound on 'external'\n\
          variation (life, work, illness, weather, etc.) that's left over even after\n\
@@ -189,8 +195,8 @@ pub fn run(config: &Config) -> Result<()> {
 
     // --- Fit + report per target ---------------------------------------
     let mut fits: Vec<TargetFit> = Vec::new();
-    for (target_col, label, baseline_days) in TARGETS {
-        match fit_target(&joined, target_col, label, *baseline_days) {
+    for (target_col, label) in TARGETS {
+        match fit_target(&joined, target_col, label) {
             Ok(Some(fit)) => {
                 print_target_report(&fit);
                 fits.push(fit);
@@ -282,12 +288,7 @@ fn type_in_list(types: &[&str]) -> Expr {
 /// Doing the fit here without printing lets `run` collect every successful
 /// fit so they can be persisted to a single parquet, while keeping the
 /// printed report driven by `print_target_report` from the same struct.
-fn fit_target(
-    joined: &DataFrame,
-    target_col: &str,
-    label: &str,
-    baseline_days: usize,
-) -> Result<Option<TargetFit>> {
+fn fit_target(joined: &DataFrame, target_col: &str, label: &str) -> Result<Option<TargetFit>> {
     // Distance rolling sums use the full window (input is 0-filled on rest
     // days, so there are no input nulls — strict min_periods is fine).
     let rolling_7d_strict = RollingOptionsFixedWindow {
@@ -309,9 +310,9 @@ fn fit_target(
         min_periods: 5,
         ..Default::default()
     };
-    let rolling_baseline = RollingOptionsFixedWindow {
-        window_size: baseline_days,
-        min_periods: baseline_days,
+    let rolling_90d_strict = RollingOptionsFixedWindow {
+        window_size: 90,
+        min_periods: 90,
         ..Default::default()
     };
 
@@ -328,11 +329,25 @@ fn fit_target(
                 .shift(lit(1))
                 .rolling_sum(rolling_28d_strict)
                 .alias("distance_28d_km"),
+            // --- 90-day rolling sum: training-volume baseline ---------------
+            // Replaces the old `signal_baseline` (90-day mean of the target
+            // signal), which mixed training and life stress indistinguishably.
+            // Using distance instead ties the baseline proxy purely to
+            // training volume, so the residual captures life stress cleanly.
+            col("distance_today_km")
+                .shift(lit(1))
+                .rolling_sum(rolling_90d_strict)
+                .alias("distance_90d_km"),
             // --- Cross-training (cycling, swimming, etc.) ------------------
             col("cross_train_today_km")
                 .shift(lit(1))
                 .rolling_sum(rolling_7d_strict)
                 .alias("cross_train_7d_km"),
+        ])
+        .with_columns([
+            // --- Squared acute-load term ------------------------------------
+            // Captures non-linear stress response to big training weeks.
+            (col("distance_7d_km") * col("distance_7d_km")).alias("distance_7d_km_sq"),
         ])
         .with_columns([
             // --- Sleep -----------------------------------------------------
@@ -347,15 +362,6 @@ fn fit_target(
                 .shift(lit(1))
                 .rolling_mean(rolling_7d_sleep)
                 .alias("sleep_hours_prior_7d"),
-            // --- Slow-moving baseline of the target ------------------------
-            // Rolling mean of the signal itself, lagged 1 day to avoid
-            // leaking the target value into its own predictor. Absorbs slow
-            // baseline drift (fitness, weight loss, etc.).
-            col(target_col)
-                .cast(DataType::Float64)
-                .shift(lit(1))
-                .rolling_mean(rolling_baseline)
-                .alias("signal_baseline"),
         ])
         .collect()?;
 
@@ -484,7 +490,7 @@ fn print_target_report(fit: &TargetFit) {
 /// target fit to a single parquet file. Per-target columns are named with the
 /// short label as a prefix:
 ///
-///   date | stress | stress_predicted | stress_external | rhr | rhr_predicted | rhr_external
+///   date | stress | stress_training | stress_external | rhr | rhr_training | rhr_external
 ///
 /// Different targets may have different fit row sets (drop_nulls drops on
 /// per-target features) so the per-fit frames are full-outer-joined on `date`.

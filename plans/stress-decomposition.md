@@ -1,22 +1,30 @@
 # Plan: decomposing measured signals into training vs. external components
 
-> **Status:** implemented as POC + plumbed into race retro. See `src/decompose.rs`.
+> **Status:** implemented + plumbed into race retro. See `src/decompose.rs`.
 >
-> **Known limitation (marathon-PR outlier):** The linear OLS decomposition
-> cannot correctly attribute stress for the marathon-PR race (Tobacco Road
-> 2021, 248 km/4wk) because the training volume is 3× any other marathon.
-> The `signal_baseline` feature absorbs slow stress drift from *both*
-> training volume and life stress indistinguishably, so the residual at high
-> volume contains "training stress the linear model couldn't capture" rather
-> than "pure life stress." Multiple feature-engineering attempts were made
-> (ACWR at 7d/28d and 28d/90d timescales, 90-day distance sums) and all
-> failed due to collinearity with existing features or redundancy with
-> signal_baseline. The decomposition works correctly for daily diagnostics
-> and shorter-distance race comparisons (10K shows stress_external with the
-> right sign, r=+0.96) where training volumes are in the linear regime.
-> The marathon limitation will diminish as more marathons are run —
-> especially any future high-volume builds — because the model will have
-> more than one data point in that regime.
+> **v5 resolution of marathon-PR outlier:** The original `signal_baseline`
+> feature (90-day rolling mean of the target signal) mixed training and life
+> stress indistinguishably — its 0.85 coefficient dominated the model and
+> caused it to attribute Vancouver's known life stress to "training" (hiding
+> it in a negative residual: external_28d = -3.2). Replacing
+> `signal_baseline` with `distance_90d_km` (90-day rolling sum of running
+> distance) ties the baseline proxy purely to training volume. Combined with
+> `distance_7d_km_sq` for non-linear acute-load response, the decomposition
+> now correctly identifies high-life-stress periods across all five marathons:
+>
+> | Race | External_28d | 4wk km | Notes |
+> |------|-------------|--------|-------|
+> | Vancouver | +5.7 | 110 | Known high life stress (confirmed) |
+> | Richmond | +5.3 | 184 | Elevated life stress |
+> | Cary (PR) | +2.1 | 248 | Low life stress, high training |
+> | Tobacco Road | -5.9 | 98 | Calm period |
+> | Disney | -8.7 | 85 | Very calm (2 weeks off work) |
+>
+> Tradeoff: R² dropped from 29% → 13% for stress because signal_baseline
+> was a powerful autoregressive predictor. The lower R² means more variance
+> lands in the residual, but the residual now measures what we actually want:
+> non-training stress. The reverse-causation caveat still applies (residuals
+> are a lower bound on external stress).
 
 ## The problem
 
@@ -65,7 +73,7 @@ Garmin also publishes `training_load` per workout (in the activities parquet) an
 
 2. **Lag matters a lot.** Stress cost of yesterday's long run shows up today, peaks 24-48h later for some workouts. Features must include lagged training load (`lag1`, `lag2`, `lag3`), not just same-day. HRV is similarly delayed; RHR is more acute (same day or +1).
 
-3. **Personal baseline drift.** RHR baseline shifts over years as fitness changes. Without modeling this, residuals will trend with fitness rather than just isolating life stress. Fix: include a slow-moving baseline (90-day rolling mean of the signal itself, lagged out so it doesn't leak the target) as one of the inputs, OR fit on rolling windows.
+3. **Personal baseline drift.** RHR baseline shifts over years as fitness changes. Without modeling this, residuals will trend with fitness rather than just isolating life stress. The original fix (v1-v4) used `signal_baseline` — a 90-day rolling mean of the target signal itself — but this mixed training and life stress indistinguishably (see v5 status block above). v5 handles baseline drift via `distance_90d_km`, which tracks slow training-volume drift without absorbing life stress into the baseline.
 
 4. **Non-training causes that look training-like.** Hot weather, sickness, travel — all raise stress/RHR independently of effort. The decomposition won't distinguish "stressed about work" from "fighting a cold"; both go in the residual. Acceptable for the user's purposes.
 
@@ -76,53 +84,50 @@ Garmin also publishes `training_load` per workout (in the activities parquet) an
 ### New module: `src/decompose.rs`
 
 ### Inputs
-- `daily_health` (target signals: `avg_stress`, `resting_hr`, `hrv_last_night`)
-- `activities` (per-workout `training_load`, `duration_sec`, `distance_m`)
-- `performance_metrics` (daily `training_load` if available — Garmin's own rollup)
+- `daily_health` (target signals: `avg_stress`, `resting_hr`)
+- `activities` (per-workout `distance_m`, `activity_type`)
 
-### Per-day training feature set
+### Per-day training feature set (v5 — current)
 | feature | description |
 |---|---|
-| `train_load_today` | sum of today's activities' `training_load` (0 on rest days) |
-| `train_load_lag1` | same, 1 day back |
-| `train_load_lag2` | same, 2 days back |
-| `train_load_lag3` | same, 3 days back |
-| `train_distance_lag1` | running distance, 1 day back |
-| `train_distance_lag2` | running distance, 2 days back |
-| `train_load_7d` | 7-day rolling sum |
-| `train_load_28d` | 28-day rolling sum (captures fitness state) |
-| `signal_baseline_90d` | 90-day rolling mean of the *target* signal, lagged 1 day to avoid leakage (absorbs long-term drift) |
+| `distance_today_km` | sum of today's running distances (0 on rest days) |
+| `distance_7d_km` | 7-day rolling sum of running distance (shift-1) |
+| `distance_28d_km` | 28-day rolling sum of running distance (shift-1) |
+| `distance_7d_km_sq` | squared 7d sum — captures non-linear acute-load stress response |
+| `distance_90d_km` | 90-day rolling sum of running distance (shift-1) — replaces `signal_baseline` to avoid mixing training and life stress in the baseline proxy |
+| `cross_train_today_km` | sum of today's cycling/swimming/hiking distances |
+| `cross_train_7d_km` | 7-day rolling sum of cross-training (shift-1) |
+| `sleep_hours_last_night` | sleep from the night that just ended (Garmin convention) |
+| `sleep_hours_prior_7d` | mean of 7 nights before last night (shift-1-then-rolling) |
 
 ### Per-target model
-- One linear regression each for `avg_stress`, `resting_hr`, `hrv_last_night`.
-- Fit on all days where the target is non-null.
-- Use time-series cross-validation (similar shape to `model::time_series_cv`) to estimate honest error and avoid leakage from future days.
-- Ordinary least squares is ~30 lines of Rust; not worth pulling in a new dependency for it.
+- One OLS linear regression each for `avg_stress` and `resting_hr`.
+- HRV was tried and dropped (~470 days insufficient for stable fit).
+- Fit on all days where the target and all features are non-null.
+- Uses smartcore's `LinearRegression::fit`.
 
 ### Outputs
 
-**A new parquet file** `decomposed_health.parquet` (sibling of the others), columns:
+**A new parquet file** `decomposed_health.parquet` (under `data_dir`), columns:
 - `date`
-- `avg_stress`, `stress_predicted_from_training`, `stress_external`
-- `resting_hr`, `rhr_predicted_from_training`, `rhr_external`
-- `hrv_last_night`, `hrv_predicted_from_training`, `hrv_external`
+- `stress`, `stress_training`, `stress_external`
+- `rhr`, `rhr_training`, `rhr_external`
 
-(`*_external` = measured − predicted.)
+(`*_training` = OLS prediction, `*_external` = measured − predicted.)
 
 **A console report** that prints, per target:
 - Coefficients (which training features matter most, with units)
-- R² (how much variance training inputs actually explain — this is the key honesty metric: if training only explains 20% of stress variance, the other 80% is "everything else" and that's load-bearing)
-- Distribution of residuals (mean, std, max)
-- A few examples: "biggest external stress days" — high actual stress + low predicted stress, sorted
+- R² (how much variance training inputs explain)
+- Distribution of residuals (MAE, range)
+- Top-10 highest-residual days (biggest "external" stress events)
 
 ### Integration with race retro
 
-Add new features in `compute_race_features`:
-- `stress_external_28d`, `stress_training_28d`, `stress_external_7d`, `stress_training_7d`
-- `rhr_external_28d`, `rhr_training_28d`
-- `hrv_external_28d`, `hrv_training_28d`
+`races.rs` reads `decomposed_health.parquet` and computes per-race features:
+- `stress_external_7d`, `stress_external_28d`, `stress_training_7d`, `stress_training_28d`
+- `rhr_external_7d`, `rhr_external_28d`
 
-These join from `decomposed_health.parquet` on date. The contrast and correlation reports pick them up automatically — no code changes needed there.
+These appear automatically in the contrast and correlation tables.
 
 This is the moment the user's hypothesis becomes directly testable: the contrast table will show good races vs bad races with the training/external split visible.
 
