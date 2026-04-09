@@ -79,8 +79,8 @@ pub fn load_decomposed_health(config: &Config) -> Result<LazyFrame> {
             path.display()
         )));
     }
-    let pattern = path.to_string_lossy().to_string();
-    LazyFrame::scan_parquet(&pattern, Default::default())
+    let path_str = path.to_string_lossy().to_string();
+    LazyFrame::scan_parquet(&path_str, Default::default())
         .map_err(|e| AppError::Data(format!("Failed to scan decomposed_health.parquet: {e}")))
 }
 

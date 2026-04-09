@@ -1,6 +1,22 @@
 # Plan: decomposing measured signals into training vs. external components
 
-> **Status:** design only, not yet implemented. Sidetracked from race-retro work — pick this up when ready.
+> **Status:** implemented as POC + plumbed into race retro. See `src/decompose.rs`.
+>
+> **Known limitation (marathon-PR outlier):** The linear OLS decomposition
+> cannot correctly attribute stress for the marathon-PR race (Tobacco Road
+> 2021, 248 km/4wk) because the training volume is 3× any other marathon.
+> The `signal_baseline` feature absorbs slow stress drift from *both*
+> training volume and life stress indistinguishably, so the residual at high
+> volume contains "training stress the linear model couldn't capture" rather
+> than "pure life stress." Multiple feature-engineering attempts were made
+> (ACWR at 7d/28d and 28d/90d timescales, 90-day distance sums) and all
+> failed due to collinearity with existing features or redundancy with
+> signal_baseline. The decomposition works correctly for daily diagnostics
+> and shorter-distance race comparisons (10K shows stress_external with the
+> right sign, r=+0.96) where training volumes are in the linear regime.
+> The marathon limitation will diminish as more marathons are run —
+> especially any future high-volume builds — because the model will have
+> more than one data point in that regime.
 
 ## The problem
 

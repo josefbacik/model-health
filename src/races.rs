@@ -733,10 +733,8 @@ fn compute_race_features(bundle: &DataBundle, race: &Race) -> FeatureMap {
     }
 
     // --- Decomposed stress / RHR (only present if `decompose` has run) -
-    // The columns in the decomposed parquet are named `stress`,
-    // `stress_predicted`, `stress_external`, `rhr`, `rhr_predicted`,
-    // `rhr_external`. Race retro features prefix the *target* (stress/rhr)
-    // and suffix with the window: `stress_external_28d`, etc.
+    // Parquet columns are `stress_training`, `stress_external`, etc.
+    // Race features add a window suffix: `stress_external_28d`.
     if let Some(decomposed) = bundle.decomposed.as_ref() {
         feats.insert(
             "stress_external_7d".into(),
@@ -748,11 +746,11 @@ fn compute_race_features(bundle: &DataBundle, race: &Race) -> FeatureMap {
         );
         feats.insert(
             "stress_training_7d".into(),
-            window_mean(decomposed, "stress_predicted", d1w, day_before),
+            window_mean(decomposed, "stress_training", d1w, day_before),
         );
         feats.insert(
             "stress_training_28d".into(),
-            window_mean(decomposed, "stress_predicted", d4w, day_before),
+            window_mean(decomposed, "stress_training", d4w, day_before),
         );
         feats.insert(
             "rhr_external_7d".into(),

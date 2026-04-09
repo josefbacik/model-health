@@ -1,20 +1,21 @@
-//! Decompose measured signals (stress, RHR, HRV) into a training-explained
+//! Decompose measured signals (stress, RHR) into a training-explained
 //! component and an external (life) residual component.
 //!
-//! This is the **POC version** of the decomposition described in
-//! `plans/stress-decomposition.md`. It is intentionally console-only:
-//!   - fits an OLS linear regression for each target
-//!   - prints coefficients, R², residual statistics, and the top-10
-//!     highest-residual days
-//!   - does NOT write a new parquet (the full version would persist
-//!     `decomposed_health.parquet` for downstream consumers like races.rs)
+//! For each target signal, fits an OLS linear regression on per-day
+//! training and sleep features, prints a console report (coefficients, R²,
+//! residual statistics, top-10 highest-residual days), and writes per-day
+//! predictions and residuals to `data_dir/decomposed_health.parquet`.
 //!
-//! The point of the POC is to answer the question "is the decomposition
-//! meaningful enough to invest plumbing in?" before building the full
-//! pipeline. If R² is very low, training inputs barely explain the signal
-//! and the residual interpretation is suspect. If R² is reasonable
-//! (say >0.15), the residual is a real lower bound on "non-training-driven
-//! variation" and worth feeding into race retros.
+//! The downstream consumer is `races.rs`, which reads the parquet and
+//! computes per-race trailing-window features like `stress_external_28d`
+//! (mean of the stress residual over the 28 days before a race). This
+//! lets the race retro separate "stress from training" from "stress from
+//! life" when comparing good vs bad races — subject to the known
+//! limitation that the linear model can't cleanly decompose the marathon-PR
+//! outlier (see `plans/stress-decomposition.md` for details).
+//!
+//! HRV was tried as a third target during POC iteration and dropped — see
+//! the comment on `TARGETS` for why.
 
 use std::path::PathBuf;
 
@@ -80,12 +81,28 @@ const TARGETS: &[(&str, &str, usize)] = &[("avg_stress", "stress", 90), ("restin
 ///
 /// History: v1 included `distance_lag2_km` / `distance_lag3_km` (collinear
 /// with distance_7d_km, sign-flipped). v2 added cross-training, sleep,
-/// Garmin's `training_load`, and dropped lag2/lag3. v3 (this version) drops
-/// `distance_lag1_km` (still slightly collinear with distance_7d_km) and
-/// `training_load_today/7d` (coefficient ≈ 0.000 in v2 — too sparse to
-/// contribute against the existing distance signal).
+/// Garmin's `training_load`, and dropped lag2/lag3. v3 dropped
+/// `distance_lag1_km` and `training_load_today/7d`. v4 (this version) adds
+/// `acwr_7d_28d` — the acute:chronic workload ratio — to capture the
+/// physiological adaptation effect that purely additive distance features
+/// can't express: the same absolute training load is much less stressful
+/// when the body has been adapted to it (high chronic baseline) than when
+/// it's a sudden ramp-up (low chronic baseline). Without an interaction
+/// feature like this, the model attributes adapted-load stress to "external"
+/// residual, which mis-decomposes high-volume training cycles like marathon
+/// PR builds.
 const FEATURES: &[&str] = &[
-    // Running distance: today + medium/long rolling sums.
+    // Running distance: today + short/medium rolling sums.
+    //
+    // A 90-day sum and an acute:chronic workload ratio (ACWR) were tried
+    // in v4-v5 and dropped. The 90-day sum was structurally redundant with
+    // `signal_baseline` (90-day rolling mean of the target itself), which
+    // already absorbs slow training-volume drift. ACWR (both 7d/28d and
+    // 28d/90d timescales) was collinear with the component distance
+    // features and produced sign-flipped coefficients. Neither improved
+    // R² meaningfully or fixed the marathon-PR residual sign issue, which
+    // appears to be a fundamental limitation of the linear approach when
+    // one race has 3× the training volume of the others.
     "distance_today_km",
     "distance_7d_km",
     "distance_28d_km",
@@ -316,6 +333,8 @@ fn fit_target(
                 .shift(lit(1))
                 .rolling_sum(rolling_7d_strict)
                 .alias("cross_train_7d_km"),
+        ])
+        .with_columns([
             // --- Sleep -----------------------------------------------------
             // Garmin records sleep against the morning the sleep ends, so
             // sleep_hours at row D == "the night that just ended on day D"
@@ -528,17 +547,22 @@ fn build_per_fit_frame(fit: &TargetFit) -> Result<DataFrame> {
     let date_series = fit.clean.column("date")?.clone();
 
     let actual_name = fit.label.clone();
-    let predicted_name = format!("{}_predicted", fit.label);
+    // Column naming: `{label}_training` for the OLS-predicted (training-
+    // explained) component, `{label}_external` for the residual. Using
+    // `_training` rather than `_predicted` so the column names align with
+    // the downstream race features (`stress_training_28d`, etc.) without
+    // a naming translation layer.
+    let training_name = format!("{}_training", fit.label);
     let external_name = format!("{}_external", fit.label);
 
     let actual = Series::new(actual_name.as_str().into(), &fit.y);
-    let predicted = Series::new(predicted_name.as_str().into(), &fit.preds);
+    let training = Series::new(training_name.as_str().into(), &fit.preds);
     let external = Series::new(external_name.as_str().into(), &fit.residuals);
 
     DataFrame::new(vec![
         date_series,
         actual.into(),
-        predicted.into(),
+        training.into(),
         external.into(),
     ])
     .map_err(|e| AppError::Model(format!("build_per_fit_frame for {}: {e}", fit.label)))
