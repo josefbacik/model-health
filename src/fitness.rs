@@ -607,6 +607,345 @@ pub fn run(config: &Config) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Cardiac Drift
+// ---------------------------------------------------------------------------
+
+/// Per-run cardiac drift result.
+#[allow(dead_code)]
+struct RunDrift {
+    date: chrono::NaiveDate,
+    distance_km: f64,
+    decoupling_pct: f64, // (CE_h1 - CE_h2) / CE_h1 * 100; positive = normal drift
+    hr_drift_pct: f64,   // (HR_h2 - HR_h1) / HR_h1 * 100
+    hr_h1: f64,
+    hr_h2: f64,
+    gap_h1: f64,
+    gap_h2: f64,
+    avg_hr: f64,
+    temp: Option<f64>,
+}
+
+/// Compute cardiac drift for a single activity.
+/// Splits the run into first and second halves (by elapsed time, post-warmup)
+/// and compares grade-adjusted efficiency between halves.
+fn compute_run_drift(
+    date: chrono::NaiveDate,
+    distance_km: f64,
+    avg_hr_activity: f64,
+    detail_path: &std::path::Path,
+) -> Option<RunDrift> {
+    let df = LazyFrame::scan_parquet(detail_path.to_string_lossy().as_ref(), Default::default())
+        .ok()?
+        .collect()
+        .ok()?;
+
+    if df.height() < 120 {
+        return None;
+    }
+
+    let col_f64 =
+        |name: &str| -> Option<Column> { df.column(name).ok()?.cast(&DataType::Float64).ok() };
+
+    let altitude = col_f64("altitude")?;
+    let distance = col_f64("distance")?;
+    let speed = col_f64("speed")?;
+    let hr = col_f64("heart_rate")?;
+    let elapsed = col_f64("elapsed_sec")?;
+    let temperature = col_f64("temperature");
+
+    let alt_f = altitude.f64().ok()?;
+    let dist_f = distance.f64().ok()?;
+    let speed_f = speed.f64().ok()?;
+    let hr_f = hr.f64().ok()?;
+    let elapsed_f = elapsed.f64().ok()?;
+    let temp_f = temperature.as_ref().and_then(|c| c.f64().ok());
+
+    let n = df.height();
+
+    // Smoothed altitude (15-sec window)
+    let mut alt_smooth = vec![0.0f64; n];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        let start = i.saturating_sub(7);
+        let end = (i + 8).min(n);
+        let mut sum = 0.0;
+        let mut count = 0;
+        for j in start..end {
+            if let Some(a) = alt_f.get(j) {
+                sum += a;
+                count += 1;
+            }
+        }
+        alt_smooth[i] = if count > 0 { sum / count as f64 } else { 0.0 };
+    }
+
+    // Collect per-second (elapsed, gap_speed, hr) tuples
+    let mut rows: Vec<(f64, f64, f64)> = Vec::new();
+    let mut temps: Vec<f64> = Vec::new();
+
+    for i in 1..n {
+        let Some(spd) = speed_f.get(i) else { continue };
+        let Some(heart) = hr_f.get(i) else { continue };
+        let Some(el) = elapsed_f.get(i) else { continue };
+        if el < WARMUP_SECONDS || spd < MIN_SPEED || heart < MIN_HR {
+            continue;
+        }
+        let d_dist = match (dist_f.get(i), dist_f.get(i - 1)) {
+            (Some(a), Some(b)) if (a - b) >= 1.0 => a - b,
+            _ => continue,
+        };
+        let d_alt = alt_smooth[i] - alt_smooth[i - 1];
+        let grade = (d_alt / d_dist).clamp(-0.45, 0.45);
+        let cost = minetti_cost(grade).max(1.0);
+        let gap_spd = spd * cost / FLAT_COST;
+
+        rows.push((el, gap_spd, heart));
+        if let Some(t) = temp_f.and_then(|f| f.get(i)) {
+            temps.push(t);
+        }
+    }
+
+    if rows.len() < 60 {
+        return None;
+    }
+
+    // Split into halves by elapsed time
+    let mid_time = (rows.first().unwrap().0 + rows.last().unwrap().0) / 2.0;
+    let h1: Vec<(f64, f64)> = rows
+        .iter()
+        .filter(|(e, _, _)| *e < mid_time)
+        .map(|(_, g, h)| (*g, *h))
+        .collect();
+    let h2: Vec<(f64, f64)> = rows
+        .iter()
+        .filter(|(e, _, _)| *e >= mid_time)
+        .map(|(_, g, h)| (*g, *h))
+        .collect();
+
+    if h1.len() < 20 || h2.len() < 20 {
+        return None;
+    }
+
+    let gap_h1 = h1.iter().map(|(g, _)| g).sum::<f64>() / h1.len() as f64;
+    let gap_h2 = h2.iter().map(|(g, _)| g).sum::<f64>() / h2.len() as f64;
+    let hr_h1 = h1.iter().map(|(_, h)| h).sum::<f64>() / h1.len() as f64;
+    let hr_h2 = h2.iter().map(|(_, h)| h).sum::<f64>() / h2.len() as f64;
+
+    let ce_h1 = gap_h1 / hr_h1;
+    let ce_h2 = gap_h2 / hr_h2;
+
+    let decoupling = (ce_h1 - ce_h2) / ce_h1 * 100.0;
+    let hr_drift = (hr_h2 - hr_h1) / hr_h1 * 100.0;
+
+    let avg_temp = if temps.is_empty() {
+        None
+    } else {
+        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    };
+
+    Some(RunDrift {
+        date,
+        distance_km,
+        decoupling_pct: decoupling,
+        hr_drift_pct: hr_drift,
+        hr_h1,
+        hr_h2,
+        gap_h1,
+        gap_h2,
+        avg_hr: avg_hr_activity,
+        temp: avg_temp,
+    })
+}
+
+/// Cardiac drift report entry point.
+pub fn drift(config: &Config) -> Result<()> {
+    let activities = data::load_activities(config)?
+        .filter(data::type_in_list(RUNNING_TYPES))
+        .filter(col("distance_m").gt(lit(5000))) // skip very short runs
+        .select([
+            col("activity_id"),
+            col("start_time_local"),
+            col("distance_m"),
+            col("duration_sec"),
+            col("avg_hr"),
+        ])
+        .sort(["start_time_local"], Default::default())
+        .collect()?;
+
+    let details_dir = config.garmin_storage_path.join("activity_details");
+    if !details_dir.exists() {
+        println!(
+            "No activity details on disk. Run `model-health fetch --from <date> --only activity-details` first."
+        );
+        return Ok(());
+    }
+
+    let mut runs: Vec<RunDrift> = Vec::new();
+
+    let ids = activities.column("activity_id")?.i64()?;
+    let times = activities.column("start_time_local")?.datetime()?;
+    let dists = activities.column("distance_m")?.f64()?;
+    let hrs = activities.column("avg_hr")?.cast(&DataType::Float64)?;
+    let hr_f = hrs.f64()?;
+
+    for i in 0..activities.height() {
+        let Some(aid) = ids.get(i) else { continue };
+        let Some(ts) = times.get(i) else { continue };
+        let Some(date) =
+            chrono::DateTime::from_timestamp_micros(ts).map(|dt| dt.naive_utc().date())
+        else {
+            continue;
+        };
+        let dist_km = dists.get(i).unwrap_or(0.0) / 1000.0;
+        let avg_hr = hr_f.get(i).unwrap_or(0.0);
+
+        let detail_path = details_dir.join(format!("{}.parquet", aid));
+        if !detail_path.exists() {
+            continue;
+        }
+
+        if let Some(d) = compute_run_drift(date, dist_km, avg_hr, &detail_path) {
+            runs.push(d);
+        }
+    }
+
+    if runs.is_empty() {
+        println!("No runs with enough data for drift analysis.");
+        return Ok(());
+    }
+
+    runs.sort_by_key(|r| r.date);
+
+    println!("=== Cardiac Drift Report ===\n");
+    println!("Decoupling = drop in pace:HR efficiency from 1st to 2nd half.");
+    println!("Benchmark: <5% = strong aerobic base, 5-10% = normal, >10% = needs work");
+    println!("\nAnalyzed {} runs (5+ km with detail data).\n", runs.len());
+
+    // Overall stats
+    let all_dec: Vec<f64> = runs.iter().map(|r| r.decoupling_pct).collect();
+    let mean_dec = all_dec.iter().sum::<f64>() / all_dec.len() as f64;
+    let mut sorted = all_dec.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_dec = sorted[sorted.len() / 2];
+
+    println!("Overall: mean={:.1}%, median={:.1}%", mean_dec, median_dec);
+
+    // By distance
+    println!("\n--- By Distance ---\n");
+    for (lo, hi, label) in [
+        (5.0, 8.0, " 5-8 km"),
+        (8.0, 12.0, " 8-12 km"),
+        (12.0, 18.0, "12-18 km"),
+        (18.0, 30.0, "18-30 km"),
+        (30.0, 100.0, "   30+ km"),
+    ] {
+        let bucket: Vec<&RunDrift> = runs
+            .iter()
+            .filter(|r| r.distance_km >= lo && r.distance_km < hi)
+            .collect();
+        if bucket.len() >= 5 {
+            let avg = bucket.iter().map(|r| r.decoupling_pct).sum::<f64>() / bucket.len() as f64;
+            let hr_d = bucket.iter().map(|r| r.hr_drift_pct).sum::<f64>() / bucket.len() as f64;
+            println!(
+                "  {}: decoupling={:+.1}%  HR drift={:+.1}%  (n={})",
+                label,
+                avg,
+                hr_d,
+                bucket.len()
+            );
+        }
+    }
+
+    // By temperature
+    let with_temp: Vec<&RunDrift> = runs.iter().filter(|r| r.temp.is_some()).collect();
+    if with_temp.len() > 20 {
+        println!("\n--- By Temperature ---\n");
+        for (lo, hi, label) in [
+            (0.0, 18.0, "Cool (<18°C)"),
+            (18.0, 24.0, "Mild (18-24°C)"),
+            (24.0, 30.0, "Warm (24-30°C)"),
+            (30.0, 50.0, "Hot (30+°C)"),
+        ] {
+            let bucket: Vec<&&RunDrift> = with_temp
+                .iter()
+                .filter(|r| {
+                    let t = r.temp.unwrap();
+                    t >= lo && t < hi
+                })
+                .collect();
+            if bucket.len() >= 5 {
+                let avg =
+                    bucket.iter().map(|r| r.decoupling_pct).sum::<f64>() / bucket.len() as f64;
+                println!(
+                    "  {:>18}: decoupling={:+.1}%  (n={})",
+                    label,
+                    avg,
+                    bucket.len()
+                );
+            }
+        }
+    }
+
+    // Yearly trend
+    println!("\n--- Yearly Trend ---\n");
+    let mut by_year: HashMap<i32, Vec<f64>> = HashMap::new();
+    for r in &runs {
+        by_year
+            .entry(r.date.year())
+            .or_default()
+            .push(r.decoupling_pct);
+    }
+    let mut years: Vec<i32> = by_year.keys().cloned().collect();
+    years.sort();
+    for y in &years {
+        let vals = &by_year[y];
+        let avg = vals.iter().sum::<f64>() / vals.len() as f64;
+        let bar_len = (avg.clamp(0.0, 15.0) / 15.0 * 20.0).round() as usize;
+        let bar: String = "█".repeat(bar_len) + &"░".repeat(20 - bar_len);
+        println!("  {}: {:+5.1}%  {}  (n={})", y, avg, bar, vals.len());
+    }
+
+    // Last 10 runs
+    let recent_n = 10.min(runs.len());
+    let recent = &runs[runs.len() - recent_n..];
+    println!("\n--- Last {} Runs ---\n", recent_n);
+    println!(
+        "{:>12} {:>6} {:>9} {:>7} {:>7} {:>6}",
+        "Date", "Dist", "Decouple", "HR 1st", "HR 2nd", "Drift"
+    );
+    for r in recent {
+        println!(
+            "{:>12} {:>5.1}k {:>+8.1}% {:>7.0} {:>7.0} {:>+5.1}%",
+            r.date, r.distance_km, r.decoupling_pct, r.hr_h1, r.hr_h2, r.hr_drift_pct,
+        );
+    }
+
+    // Interpretation
+    let recent_avg = recent.iter().map(|r| r.decoupling_pct).sum::<f64>() / recent.len() as f64;
+    println!();
+    if recent_avg < 5.0 {
+        println!(
+            "Your recent decoupling ({:.1}%) is under 5% — your aerobic base is solid.",
+            recent_avg
+        );
+    } else if recent_avg < 10.0 {
+        println!(
+            "Your recent decoupling ({:.1}%) is in the normal range.",
+            recent_avg
+        );
+        println!("Consistent easy running and long runs will bring this down.");
+    } else {
+        println!(
+            "Your recent decoupling ({:.1}%) is elevated — your aerobic base needs work.",
+            recent_avg
+        );
+        println!("Focus on easy-effort runs and gradually build duration.");
+    }
+
+    Ok(())
+}
+
 /// Compute Pearson correlation coefficient from paired (x, y) values.
 fn pearson(pairs: &[(f64, f64)]) -> f64 {
     let n = pairs.len() as f64;

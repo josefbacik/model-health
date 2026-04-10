@@ -102,6 +102,9 @@ enum Commands {
     /// Cardiac efficiency fitness report: grade-adjusted speed/HR trends,
     /// current state, and training drivers.
     Fitness,
+    /// Cardiac drift analysis: how much does pace:HR efficiency drop from
+    /// the first to second half of each run? Lower drift = better aerobic base.
+    Drift,
 }
 
 #[tokio::main]
@@ -190,6 +193,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Fitness => {
             fitness::run(&config)?;
+        }
+        Commands::Drift => {
+            fitness::drift(&config)?;
         }
     }
 
