@@ -43,10 +43,11 @@ const MIN_HR: f64 = 100.0;
 /// Number of recent runs to show individually in the report.
 const RECENT_RUNS: usize = 10;
 
-/// Maximum speed coefficient of variation (std/mean * 100) to consider a run
-/// "steady" for drift analysis. Interval workouts have large speed swings
-/// (CV > 10%) while steady runs are typically 5-8%.
-const MAX_SPEED_CV_PCT: f64 = 10.0;
+/// Maximum heart rate coefficient of variation (std/mean * 100) to consider
+/// a run "steady" for drift analysis. Interval workouts produce large HR
+/// swings (CV > 8.5%) from hard/easy alternation, while steady runs on hilly
+/// terrain are typically 5-7.5% (hills affect speed but not HR as much).
+const MAX_HR_CV_PCT: f64 = 8.5;
 
 /// Minetti et al. (2002) metabolic cost of running as a function of grade.
 ///
@@ -697,7 +698,6 @@ fn compute_run_drift(
 
     // Collect per-second (elapsed, gap_speed, hr) tuples
     let mut rows: Vec<(f64, f64, f64)> = Vec::new();
-    let mut raw_speeds: Vec<f64> = Vec::new();
     let mut temps: Vec<f64> = Vec::new();
 
     for i in 1..n {
@@ -717,7 +717,6 @@ fn compute_run_drift(
         let gap_spd = spd * cost / FLAT_COST;
 
         rows.push((el, gap_spd, heart));
-        raw_speeds.push(spd);
         if let Some(t) = temp_f.and_then(|f| f.get(i)) {
             temps.push(t);
         }
@@ -727,16 +726,18 @@ fn compute_run_drift(
         return None;
     }
 
-    // Skip interval workouts: high speed variance means structured intervals
-    // rather than steady running, which invalidates the half-split drift model.
-    let speed_mean = raw_speeds.iter().sum::<f64>() / raw_speeds.len() as f64;
-    let speed_var = raw_speeds
+    // Skip interval workouts: HR coefficient of variation detects the
+    // hard/easy alternation pattern of structured intervals. Hills affect
+    // speed CV heavily but HR stays relatively steady on even-effort runs,
+    // so HR CV is a better discriminator than speed CV for hilly courses.
+    let hr_mean = rows.iter().map(|(_, _, h)| h).sum::<f64>() / rows.len() as f64;
+    let hr_var = rows
         .iter()
-        .map(|s| (s - speed_mean).powi(2))
+        .map(|(_, _, h)| (h - hr_mean).powi(2))
         .sum::<f64>()
-        / raw_speeds.len() as f64;
-    let speed_cv = speed_var.sqrt() / speed_mean * 100.0;
-    if speed_cv > MAX_SPEED_CV_PCT {
+        / rows.len() as f64;
+    let hr_cv = hr_var.sqrt() / hr_mean * 100.0;
+    if hr_cv > MAX_HR_CV_PCT {
         return None;
     }
 
