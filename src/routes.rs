@@ -58,8 +58,11 @@ struct RoutedRun {
     location_name: String,
 }
 
+/// Number of days to consider "recent" for filtering routes.
+const RECENT_DAYS: i64 = 90;
+
 /// Entry point.
-pub fn run(config: &Config) -> Result<()> {
+pub fn run(config: &Config, show_all: bool) -> Result<()> {
     let activities = data::load_activities(config)?
         .filter(data::type_in_list(RUNNING_TYPES))
         .filter(col("distance_m").gt(lit(3000)))
@@ -223,25 +226,47 @@ pub fn run(config: &Config) -> Result<()> {
         }
     }
 
-    // Filter to routes with enough runs and sort by count
+    // Filter to routes with enough runs
     routes.retain(|r| r.runs.len() >= MIN_ROUTE_RUNS);
+
+    // Unless --all, only show routes with a run in the last RECENT_DAYS
+    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(RECENT_DAYS);
+    if !show_all {
+        routes.retain(|r| r.runs.iter().any(|run| run.date >= cutoff));
+    }
+
     routes.sort_by(|a, b| b.runs.len().cmp(&a.runs.len()));
 
     if routes.is_empty() {
-        println!(
-            "No routes with {} or more steady runs found.",
-            MIN_ROUTE_RUNS
-        );
+        if show_all {
+            println!(
+                "No routes with {} or more steady runs found.",
+                MIN_ROUTE_RUNS
+            );
+        } else {
+            println!(
+                "No routes with recent activity (last {} days). Use --all to see all routes.",
+                RECENT_DAYS
+            );
+        }
         return Ok(());
     }
 
     // Phase 3: Report
     println!("=== Route Fitness Report ===\n");
-    println!(
-        "Found {} routes with {}+ steady runs.\n",
-        routes.len(),
-        MIN_ROUTE_RUNS
-    );
+    if show_all {
+        println!(
+            "Showing all {} routes with {}+ steady runs.\n",
+            routes.len(),
+            MIN_ROUTE_RUNS
+        );
+    } else {
+        println!(
+            "Showing {} routes with activity in the last {} days. Use --all for all routes.\n",
+            routes.len(),
+            RECENT_DAYS
+        );
+    }
 
     for (idx, route) in routes.iter().enumerate() {
         let runs = &route.runs;
@@ -327,7 +352,7 @@ pub fn run(config: &Config) -> Result<()> {
         // Last 5 runs on this route
         println!();
         println!(
-            "   {:<12}{:>7} {:>7} {:>5} {:>5}",
+            "   {:>12} {:>7} {:>7} {:>5} {:>5}",
             "Date", "CE", "GAP", "HR", "Temp"
         );
         for r in recent {
@@ -343,7 +368,7 @@ pub fn run(config: &Config) -> Result<()> {
                 "\x1b[31m▼\x1b[0m"
             };
             println!(
-                " {} {:<12}{:>7.4} {:>7} {:>5.0} {:>5}",
+                " {} {:>12} {:>7.4} {:>7} {:>5.0} {:>5}",
                 indicator,
                 r.date,
                 r.ce,

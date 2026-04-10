@@ -107,8 +107,13 @@ enum Commands {
     /// the first to second half of each run? Lower drift = better aerobic base.
     Drift,
     /// Route-based fitness tracking: identifies common routes via GPS and
-    /// tracks cardiac efficiency on each route over time.
-    Routes,
+    /// tracks cardiac efficiency on each route over time. By default shows
+    /// only routes with recent runs; use --all to see all detected routes.
+    Routes {
+        /// Show all routes, not just those with recent activity
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[tokio::main]
@@ -201,8 +206,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Drift => {
             fitness::drift(&config)?;
         }
-        Commands::Routes => {
-            routes::run(&config)?;
+        Commands::Routes { all } => {
+            routes::run(&config, all)?;
         }
     }
 
