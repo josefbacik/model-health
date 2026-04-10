@@ -23,10 +23,10 @@ use crate::validation;
 /// Negative means hotter = less efficient.
 /// Derived from OLS on ~700 runs (2020-2026): eff = 0.0193 - 0.000111*temp,
 /// r=-0.32. Effect is ~0.001 CE per 10°C.
-const TEMP_COEFF: f64 = -0.000111;
+pub const TEMP_COEFF: f64 = -0.000111;
 
 /// Reference temperature for normalization (°C).
-const TEMP_REF: f64 = 20.0;
+pub const TEMP_REF: f64 = 20.0;
 
 /// Minimum seconds of steady-state data to compute CE for a run.
 const MIN_STEADY_SECONDS: usize = 30;
@@ -50,21 +50,21 @@ const RECENT_RUNS: usize = 10;
 const MAX_HR_CV_PCT: f64 = 8.5;
 
 /// Per-second row of processed running data (post-warmup, filtered, grade-adjusted).
-struct SteadyRow {
-    elapsed: f64,
-    gap_speed: f64,
-    heart_rate: f64,
-    temperature: Option<f64>,
-    cadence: Option<f64>,
-    gct: Option<f64>,
-    stride: Option<f64>,
+pub struct SteadyRow {
+    pub elapsed: f64,
+    pub gap_speed: f64,
+    pub heart_rate: f64,
+    pub temperature: Option<f64>,
+    pub cadence: Option<f64>,
+    pub gct: Option<f64>,
+    pub stride: Option<f64>,
 }
 
 /// Load a detail parquet and extract filtered, grade-adjusted per-second rows.
 /// Handles altitude smoothing, warmup exclusion, speed/HR filtering, and
 /// Minetti grade adjustment. Returns None if the file lacks required columns
 /// or has too little data.
-fn load_steady_rows(detail_path: &std::path::Path) -> Option<Vec<SteadyRow>> {
+pub fn load_steady_rows(detail_path: &std::path::Path) -> Option<Vec<SteadyRow>> {
     let df = LazyFrame::scan_parquet(detail_path.to_string_lossy().as_ref(), Default::default())
         .ok()?
         .collect()
@@ -235,7 +235,7 @@ fn compute_run_ce(
 }
 
 /// Format speed as min:sec per km pace string.
-fn format_pace(speed_mps: f64) -> String {
+pub fn format_pace(speed_mps: f64) -> String {
     if speed_mps <= 0.0 {
         return "---".to_string();
     }

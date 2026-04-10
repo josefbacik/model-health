@@ -8,6 +8,7 @@ mod fitness;
 mod injury_risk;
 mod model;
 mod races;
+mod routes;
 mod sync;
 mod validation;
 
@@ -105,6 +106,9 @@ enum Commands {
     /// Cardiac drift analysis: how much does pace:HR efficiency drop from
     /// the first to second half of each run? Lower drift = better aerobic base.
     Drift,
+    /// Route-based fitness tracking: identifies common routes via GPS and
+    /// tracks cardiac efficiency on each route over time.
+    Routes,
 }
 
 #[tokio::main]
@@ -196,6 +200,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Drift => {
             fitness::drift(&config)?;
+        }
+        Commands::Routes => {
+            routes::run(&config)?;
         }
     }
 
