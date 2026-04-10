@@ -78,12 +78,66 @@ Primary date column: `date` (Date)
 Columns: systolic, diastolic, pulse (i32), category (i32), category_name (String),
 notes (String), timestamp_gmt, timestamp_local (String)
 
+### activity_details (per-activity partitioned, many rows per activity)
+Primary key: `activity_id` (i64) — one parquet file per activity.
+Time-series data from the Garmin details endpoint (resolution depends on
+`maxChartSize`; GPS coordinates are linearly interpolated from the separate
+polyline array and are approximate).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| activity_id | i64 | FK to activities |
+| timestamp_ms | i64 | Epoch ms (from directTimestamp metric) |
+| elapsed_sec | f64 | Accounts for auto-pause |
+| heart_rate | i32 | BPM |
+| cadence | i32 | steps/min or RPM |
+| speed | f64 | m/s |
+| altitude | f64 | meters |
+| distance | f64 | cumulative meters |
+| power | i32 | watts |
+| temperature | f64 | celsius |
+| ground_contact_time | f64 | ms |
+| vertical_oscillation | f64 | cm |
+| stride_length | f64 | meters |
+| ground_contact_balance | f64 | L/R % |
+| respiration_rate | f64 | breaths/min |
+| lat | f64 | from directLatitude metric |
+| lon | f64 | from directLongitude metric |
+
+### activity_splits (per-activity partitioned, few rows per activity)
+Primary key: `activity_id` (i64) — one parquet file per activity.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| activity_id | i64 | FK to activities |
+| split_number | i32 | 1-based index |
+| split_type | String | "distance", "interval", etc. |
+| distance_m | f64 | |
+| duration_sec | f64 | |
+| avg_speed | f64 | m/s |
+| avg_hr | i32 | |
+| max_hr | i32 | |
+| avg_cadence | f64 | |
+| avg_power | f64 | watts |
+| elevation_gain | f64 | meters |
+| elevation_loss | f64 | meters |
+| start_lat | f64 | |
+| start_lon | f64 | |
+| avg_ground_contact_time | f64 | ms |
+| avg_vertical_oscillation | f64 | cm |
+| avg_stride_length | f64 | meters |
+
+### track_points (DEPRECATED)
+Legacy GPS-only data from the old garmin-cli tool. Superseded by
+`activity_details` which includes GPS plus HR/cadence/speed/running dynamics.
+
 ## CLI Commands
 
 ```
 fetch --from DATE [--to DATE] [--force] [--only <category>]
-    Categories: daily-health, weight-bp, activities
+    Categories: daily-health, weight-bp, activities, activity-details
 probe --date DATE          # dump raw Garmin JSON (debugging)
+probe-activity --id ID     # dump detail + splits JSON for one activity
 status                     # data coverage summary
 profile                    # column-level data quality stats
 train [--target TARGET]    # train Random Forest model

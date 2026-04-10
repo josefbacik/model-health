@@ -30,6 +30,9 @@ pub enum FetchCategory {
     /// Activities (paginated list, fast). Required after editing event
     /// types in Garmin Connect — pair with `--force` for that case.
     Activities,
+    /// Activity details + splits (per-activity fetch, slow for backfill).
+    /// Requires activities to be fetched first.
+    ActivityDetails,
 }
 
 impl FetchCategory {
@@ -77,6 +80,14 @@ pub async fn fetch_all(
         fetch_activities(config, &client, from, to, force).await?;
     } else {
         println!("Skipping activities (not selected by --only).");
+    }
+
+    // Activity details + splits: per-activity fetch of time-series and lap data.
+    // Depends on activities being on disk (needs activity_ids).
+    if FetchCategory::ActivityDetails.is_enabled(only) {
+        fetch_activity_details_and_splits(config, &client, force).await?;
+    } else {
+        println!("Skipping activity details (not selected by --only).");
     }
 
     Ok(())
@@ -739,6 +750,487 @@ fn activities_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> 
     Ok(ordered)
 }
 
+// ---------------------------------------------------------------------------
+// Activity Details + Splits
+// ---------------------------------------------------------------------------
+//
+// Per-activity fetch of time-series metrics (HR, cadence, speed, altitude,
+// GPS, running dynamics) and lap/split data. Stored as one parquet file per
+// activity_id under activity_details/ and activity_splits/.
+//
+// Incremental: file existence = already fetched. Activities that return 404
+// or empty data get a zero-row parquet with the correct schema.
+
+/// Retry an async closure on `garmin_connect::Error::RateLimited` with
+/// exponential backoff. Returns the first non-429 result, or the last
+/// error after `max_retries` attempts.
+async fn retry_on_rate_limit<F, Fut, T>(
+    max_retries: u32,
+    mut f: F,
+) -> std::result::Result<T, garmin_connect::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, garmin_connect::Error>>,
+{
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Err(garmin_connect::Error::RateLimited) if attempt < max_retries => {
+                attempt += 1;
+                let backoff = std::time::Duration::from_secs(1 << attempt); // 2s, 4s, 8s, ...
+                eprintln!(
+                    "  Rate limited — backing off {}s (attempt {}/{})",
+                    backoff.as_secs(),
+                    attempt,
+                    max_retries
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Build a column-index mapping from the Garmin `metricDescriptors` array.
+/// Returns a map from metric key string (e.g. "directHeartRate") to its
+/// position in each row's `metrics` array.
+fn build_metric_index(
+    descriptors: &[serde_json::Value],
+) -> std::collections::HashMap<String, usize> {
+    let mut map = std::collections::HashMap::new();
+    for desc in descriptors {
+        if let (Some(key), Some(idx)) = (
+            desc.get("key").and_then(|k| k.as_str()),
+            desc.get("metricsIndex").and_then(|v| v.as_u64()),
+        ) {
+            map.insert(key.to_string(), idx as usize);
+        }
+    }
+    map
+}
+
+/// Parse the activity details JSON response into a DataFrame.
+///
+/// The response contains:
+/// - `metricDescriptors`: array describing which metric is at which index
+/// - `activityDetailMetrics`: array of `{ metrics: [f64...] }` rows
+/// - `geoPolylineDTO.polyline`: array of `{ lat, lon, altitude, ... }` GPS points
+///
+/// GPS points are linearly interpolated onto the metrics timestamps by
+/// matching on the cumulative distance or elapsed time.
+fn parse_activity_details(activity_id: i64, json: &serde_json::Value) -> Result<DataFrame> {
+    let descriptors = json
+        .get("metricDescriptors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let metrics_rows = json
+        .get("activityDetailMetrics")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let idx = build_metric_index(&descriptors);
+
+    // Pre-allocate column vectors
+    let n = metrics_rows.len();
+    let mut activity_ids = vec![activity_id; n];
+    let mut timestamp_ms_col: Vec<Option<i64>> = Vec::with_capacity(n);
+    let mut elapsed_sec_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut heart_rate_col: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut cadence_col: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut speed_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut altitude_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut distance_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut power_col: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut temperature_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut gct_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut vo_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut stride_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut gcb_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut resp_col: Vec<Option<f64>> = Vec::with_capacity(n);
+
+    // Helper to extract a metric from a row's metrics array
+    let get_f64 = |row: &serde_json::Value, key: &str| -> Option<f64> {
+        let i = idx.get(key)?;
+        row.get("metrics")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.get(*i))
+            .and_then(|v| v.as_f64())
+    };
+
+    for row in &metrics_rows {
+        // Timestamp: directTimestamp gives epoch ms
+        let ts_ms = get_f64(row, "directTimestamp").map(|v| v as i64);
+        timestamp_ms_col.push(ts_ms);
+
+        // Elapsed duration in seconds (accounts for auto-pause)
+        let ts = get_f64(row, "sumElapsedDuration");
+        elapsed_sec_col.push(ts);
+
+        let hr = get_f64(row, "directHeartRate").map(|v| v.round() as i32);
+        heart_rate_col.push(hr);
+
+        // Running cadence (directRunCadence), cycling cadence, or
+        // directDoubleCadence (used by some watch faces / CIQ apps)
+        let cadence = get_f64(row, "directRunCadence")
+            .or_else(|| get_f64(row, "bikeCadence"))
+            .or_else(|| get_f64(row, "directDoubleCadence"))
+            .map(|v| v.round() as i32);
+        cadence_col.push(cadence);
+
+        speed_col.push(get_f64(row, "directSpeed"));
+        altitude_col.push(get_f64(row, "directElevation"));
+        distance_col.push(get_f64(row, "sumDistance"));
+        power_col.push(get_f64(row, "directPower").map(|v| v.round() as i32));
+        temperature_col.push(get_f64(row, "directAirTemperature"));
+        gct_col.push(get_f64(row, "directGroundContactTime"));
+        vo_col.push(get_f64(row, "directVerticalOscillation"));
+        stride_col.push(get_f64(row, "directStrideLength"));
+        gcb_col.push(get_f64(row, "directGroundContactBalanceLeft"));
+        resp_col.push(get_f64(row, "directRespirationRate"));
+    }
+
+    // GPS: lat/lon come directly from the metrics array (directLatitude,
+    // directLongitude). No polyline interpolation needed.
+    let mut lat_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut lon_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    for row in &metrics_rows {
+        lat_col.push(get_f64(row, "directLatitude"));
+        lon_col.push(get_f64(row, "directLongitude"));
+    }
+
+    // If there are no rows, we still need a zero-row DF with the right schema
+    if n == 0 {
+        activity_ids.clear();
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("activity_id".into(), &activity_ids),
+        Column::new("timestamp_ms".into(), &timestamp_ms_col),
+        Column::new("elapsed_sec".into(), &elapsed_sec_col),
+        Column::new("heart_rate".into(), &heart_rate_col),
+        Column::new("cadence".into(), &cadence_col),
+        Column::new("speed".into(), &speed_col),
+        Column::new("altitude".into(), &altitude_col),
+        Column::new("distance".into(), &distance_col),
+        Column::new("power".into(), &power_col),
+        Column::new("temperature".into(), &temperature_col),
+        Column::new("ground_contact_time".into(), &gct_col),
+        Column::new("vertical_oscillation".into(), &vo_col),
+        Column::new("stride_length".into(), &stride_col),
+        Column::new("ground_contact_balance".into(), &gcb_col),
+        Column::new("respiration_rate".into(), &resp_col),
+        Column::new("lat".into(), &lat_col),
+        Column::new("lon".into(), &lon_col),
+    ])?;
+
+    Ok(df)
+}
+
+/// Parse the activity splits JSON response into a DataFrame.
+fn parse_activity_splits(activity_id: i64, json: &serde_json::Value) -> Result<DataFrame> {
+    // The splits endpoint can return splits under various keys
+    let splits = json
+        .get("lapDTOs")
+        .or_else(|| json.get("splitDTOs"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let n = splits.len();
+    let activity_ids = vec![activity_id; n];
+    let mut split_number_col: Vec<i32> = Vec::with_capacity(n);
+    let mut split_type_col: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut distance_m_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut duration_sec_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut avg_speed_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut avg_hr_col: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut max_hr_col: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut avg_cadence_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut avg_power_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut elev_gain_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut elev_loss_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut start_lat_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut start_lon_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut avg_gct_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut avg_vo_col: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut avg_stride_col: Vec<Option<f64>> = Vec::with_capacity(n);
+
+    for (i, split) in splits.iter().enumerate() {
+        split_number_col.push(
+            split
+                .get("lapIndex")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+                .unwrap_or((i + 1) as i32),
+        );
+
+        // Garmin uses "intensityType" (e.g. "INTERVAL", "REST")
+        split_type_col.push(
+            split
+                .get("intensityType")
+                .or_else(|| split.get("splitType"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        );
+
+        distance_m_col.push(split.get("distance").and_then(|v| v.as_f64()));
+        duration_sec_col.push(split.get("duration").and_then(|v| v.as_f64()));
+        avg_speed_col.push(split.get("averageSpeed").and_then(|v| v.as_f64()));
+
+        avg_hr_col.push(
+            split
+                .get("averageHR")
+                .and_then(|v| v.as_f64())
+                .map(|v| v.round() as i32),
+        );
+        max_hr_col.push(
+            split
+                .get("maxHR")
+                .and_then(|v| v.as_f64())
+                .map(|v| v.round() as i32),
+        );
+
+        avg_cadence_col.push(split.get("averageRunCadence").and_then(|v| v.as_f64()));
+        avg_power_col.push(split.get("averagePower").and_then(|v| v.as_f64()));
+        elev_gain_col.push(split.get("elevationGain").and_then(|v| v.as_f64()));
+        elev_loss_col.push(split.get("elevationLoss").and_then(|v| v.as_f64()));
+        start_lat_col.push(split.get("startLatitude").and_then(|v| v.as_f64()));
+        start_lon_col.push(split.get("startLongitude").and_then(|v| v.as_f64()));
+        avg_gct_col.push(split.get("groundContactTime").and_then(|v| v.as_f64()));
+        avg_vo_col.push(split.get("verticalOscillation").and_then(|v| v.as_f64()));
+        avg_stride_col.push(split.get("strideLength").and_then(|v| v.as_f64()));
+    }
+
+    let df = DataFrame::new(vec![
+        Column::new("activity_id".into(), &activity_ids),
+        Column::new("split_number".into(), &split_number_col),
+        Column::new("split_type".into(), &split_type_col),
+        Column::new("distance_m".into(), &distance_m_col),
+        Column::new("duration_sec".into(), &duration_sec_col),
+        Column::new("avg_speed".into(), &avg_speed_col),
+        Column::new("avg_hr".into(), &avg_hr_col),
+        Column::new("max_hr".into(), &max_hr_col),
+        Column::new("avg_cadence".into(), &avg_cadence_col),
+        Column::new("avg_power".into(), &avg_power_col),
+        Column::new("elevation_gain".into(), &elev_gain_col),
+        Column::new("elevation_loss".into(), &elev_loss_col),
+        Column::new("start_lat".into(), &start_lat_col),
+        Column::new("start_lon".into(), &start_lon_col),
+        Column::new("avg_ground_contact_time".into(), &avg_gct_col),
+        Column::new("avg_vertical_oscillation".into(), &avg_vo_col),
+        Column::new("avg_stride_length".into(), &avg_stride_col),
+    ])?;
+
+    Ok(df)
+}
+
+/// Write a per-activity parquet file (atomic via .tmp + rename).
+fn write_activity_parquet(
+    dir: &std::path::Path,
+    activity_id: i64,
+    df: &mut DataFrame,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{}.parquet", activity_id));
+    let tmp_path = path.with_extension("parquet.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .finish(df)?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+/// Load all activity_ids from existing per-activity parquet files in a directory.
+/// File names are `{activity_id}.parquet`.
+fn load_existing_activity_ids(dir: &std::path::Path) -> HashSet<i64> {
+    let mut set = HashSet::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return set,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(id) = stem.parse::<i64>()
+        {
+            set.insert(id);
+        }
+    }
+    set
+}
+
+/// Load all activity_ids from the activities parquet files on disk.
+fn load_all_activity_ids(config: &Config) -> Result<Vec<i64>> {
+    let dir = config.garmin_storage_path.join("activities");
+    if !crate::data::dir_has_parquet(&dir) {
+        return Err(AppError::Data(
+            "No activities on disk. Run `model-health fetch --from <date>` first.".to_string(),
+        ));
+    }
+
+    let pattern = dir.join("*.parquet");
+    let lf = LazyFrame::scan_parquet(
+        pattern.to_string_lossy().as_ref(),
+        ScanArgsParquet {
+            allow_missing_columns: true,
+            ..Default::default()
+        },
+    )?;
+
+    let df = lf.select([col("activity_id")]).collect()?;
+    let ids: Vec<i64> = df
+        .column("activity_id")?
+        .i64()?
+        .into_no_null_iter()
+        .collect();
+
+    Ok(ids)
+}
+
+/// Fetch activity details and splits for all activities not yet fetched.
+async fn fetch_activity_details_and_splits(
+    config: &Config,
+    client: &Client,
+    force: bool,
+) -> Result<()> {
+    let all_ids = match load_all_activity_ids(config) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("  Skipping activity details: {}", e);
+            return Ok(());
+        }
+    };
+
+    let details_dir = config.garmin_storage_path.join("activity_details");
+    let splits_dir = config.garmin_storage_path.join("activity_splits");
+
+    let existing = if force {
+        HashSet::new()
+    } else {
+        // Check details dir only — both are always written together
+        load_existing_activity_ids(&details_dir)
+    };
+
+    let mut todo: Vec<i64> = all_ids
+        .into_iter()
+        .filter(|id| !existing.contains(id))
+        .collect();
+    todo.sort(); // oldest first (activity IDs are monotonically increasing)
+
+    if todo.is_empty() {
+        println!(
+            "Activity details: all {} activities already fetched.",
+            existing.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Fetching activity details for {} activities ({} already on disk){}...",
+        todo.len(),
+        existing.len(),
+        if force { " (force)" } else { "" },
+    );
+
+    let started = Instant::now();
+    let total = todo.len() as i64;
+    let mut fetched = 0i64;
+    let mut errors = 0u32;
+
+    for &activity_id in &todo {
+        fetched += 1;
+        let (elapsed, eta) = elapsed_and_eta(started, fetched, total);
+        print!(
+            "\r  Activity {}/{} (id={})  [{} elapsed, {} ETA]    ",
+            fetched, total, activity_id, elapsed, eta
+        );
+
+        // Fetch details
+        let details_path = format!(
+            "/activity-service/activity/{}/details?maxChartSize=100000&maxPolylineSize=100000",
+            activity_id
+        );
+        let details_result =
+            retry_on_rate_limit(3, || client.get_json::<serde_json::Value>(&details_path)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Fetch splits
+        let splits_path = format!("/activity-service/activity/{}/splits", activity_id);
+        let splits_result =
+            retry_on_rate_limit(3, || client.get_json::<serde_json::Value>(&splits_path)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Classify results: Ok => data, NotFound => no data (write zero-row),
+        // other error => skip entirely (don't write, so it gets retried next run)
+        let details_json = match details_result {
+            Ok(v) => Some(v),
+            Err(garmin_connect::Error::NotFound(_)) => None,
+            Err(e) => {
+                errors += 1;
+                eprintln!(
+                    "\n  Warning: details fetch failed for {}: {} (will retry next run)",
+                    activity_id, e
+                );
+                continue;
+            }
+        };
+        let splits_json = match splits_result {
+            Ok(v) => Some(v),
+            Err(garmin_connect::Error::NotFound(_)) => None,
+            Err(e) => {
+                errors += 1;
+                eprintln!(
+                    "\n  Warning: splits fetch failed for {}: {} (will retry next run)",
+                    activity_id, e
+                );
+                continue;
+            }
+        };
+
+        // Parse and write details (zero-row if 404 / no data)
+        let mut details_df = match &details_json {
+            Some(json) => parse_activity_details(activity_id, json)?,
+            None => {
+                parse_activity_details(activity_id, &serde_json::Value::Object(Default::default()))?
+            }
+        };
+        write_activity_parquet(&details_dir, activity_id, &mut details_df)?;
+
+        // Parse and write splits (zero-row if 404 / no data)
+        let mut splits_df = match &splits_json {
+            Some(json) => parse_activity_splits(activity_id, json)?,
+            None => {
+                parse_activity_splits(activity_id, &serde_json::Value::Object(Default::default()))?
+            }
+        };
+        write_activity_parquet(&splits_dir, activity_id, &mut splits_df)?;
+    }
+
+    println!();
+    println!(
+        "  Done: {} activities fetched in {}{}",
+        total,
+        format_secs(started.elapsed().as_secs()),
+        if errors > 0 {
+            format!(" ({} errors)", errors)
+        } else {
+            String::new()
+        }
+    );
+
+    Ok(())
+}
+
 /// List the ISO weeks already represented as `activities/YYYY-Wnn.parquet`
 /// files on disk.
 fn load_existing_weeks(config: &Config) -> Result<HashSet<(i32, u32)>> {
@@ -1218,6 +1710,48 @@ pub async fn probe(date: NaiveDate) -> Result<()> {
             Err(e) => println!("ERROR: {}", e),
         }
         println!();
+    }
+
+    Ok(())
+}
+
+/// Probe the activity detail + splits endpoints for a single activity ID.
+/// Used to inspect the actual API response structure before writing parsers.
+pub async fn probe_activity(activity_id: i64, max_chart_size: u32) -> Result<()> {
+    println!("Authenticating...");
+    let (_oauth1, oauth2) = crate::sync::authenticate().await?;
+    let client = Client::new(oauth2);
+    println!("Authenticated.\n");
+
+    let endpoints: Vec<(&str, String)> = vec![
+        (
+            "activity details",
+            format!(
+                "/activity-service/activity/{}/details?maxChartSize={}&maxPolylineSize={}",
+                activity_id, max_chart_size, max_chart_size
+            ),
+        ),
+        (
+            "activity splits",
+            format!("/activity-service/activity/{}/splits", activity_id),
+        ),
+    ];
+
+    for (label, path) in endpoints {
+        println!("==== {} ====", label);
+        println!("GET {}", path);
+        match client.get_json::<serde_json::Value>(&path).await {
+            Ok(v) => {
+                summarize_json(&v);
+                println!(
+                    "FULL: {}",
+                    serde_json::to_string_pretty(&v).unwrap_or_default()
+                );
+            }
+            Err(e) => println!("ERROR: {}", e),
+        }
+        println!();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     Ok(())

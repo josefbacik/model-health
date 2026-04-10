@@ -67,6 +67,18 @@ pub fn load_blood_pressure(config: &Config) -> Result<LazyFrame> {
     scan_entity(&config.garmin_storage_path, "blood_pressure")
 }
 
+/// Load per-activity time-series detail data as a LazyFrame.
+#[allow(dead_code)]
+pub fn load_activity_details(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "activity_details")
+}
+
+/// Load per-activity lap/split data as a LazyFrame.
+#[allow(dead_code)]
+pub fn load_activity_splits(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "activity_splits")
+}
+
 /// Load the decomposed-health parquet (output of `model-health decompose`).
 /// Lives under `data_dir` rather than `garmin_storage_path` because it's
 /// derived from raw data, not fetched. Returns an error if the file doesn't

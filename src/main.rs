@@ -46,9 +46,10 @@ enum Commands {
         /// select multiple. When omitted, all categories run (default).
         ///
         /// Categories:
-        ///   daily-health  per-day daily summary + performance metrics (slow)
-        ///   weight-bp     monthly weight + blood pressure (fast)
-        ///   activities    paginated activity list (fast)
+        ///   daily-health      per-day daily summary + performance metrics (slow)
+        ///   weight-bp         monthly weight + blood pressure (fast)
+        ///   activities        paginated activity list (fast)
+        ///   activity-details  per-activity time-series + splits (slow for backfill)
         ///
         /// Example: `model-health fetch --from 2017-01-01 --force --only activities`
         #[arg(long, value_enum)]
@@ -59,6 +60,15 @@ enum Commands {
         /// Date to probe (YYYY-MM-DD)
         #[arg(long)]
         date: NaiveDate,
+    },
+    /// Dump raw JSON from the activity detail + splits endpoints (debugging)
+    ProbeActivity {
+        /// Activity ID to probe
+        #[arg(long)]
+        id: i64,
+        /// Max chart size to request (controls time-series resolution)
+        #[arg(long, default_value = "100000")]
+        max_chart_size: u32,
     },
     /// Show data coverage and sync status
     Status,
@@ -110,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Probe { date } => {
             fetch::probe(date).await?;
+        }
+        Commands::ProbeActivity { id, max_chart_size } => {
+            fetch::probe_activity(id, max_chart_size).await?;
         }
         Commands::Status => {
             println!("Garmin storage: {}", config.garmin_storage_path.display());
