@@ -351,10 +351,6 @@ pub fn run(config: &Config, show_all: bool) -> Result<()> {
 
         // Last 5 runs on this route
         println!();
-        println!(
-            "   {:>12} {:>7} {:>7} {:>5} {:>5}",
-            "Date", "CE", "GAP", "HR", "Temp"
-        );
         for r in recent {
             let temp_s = r
                 .avg_temp
@@ -368,7 +364,7 @@ pub fn run(config: &Config, show_all: bool) -> Result<()> {
                 "\x1b[31m▼\x1b[0m"
             };
             println!(
-                " {} {:>12} {:>7.4} {:>7} {:>5.0} {:>5}",
+                "  {} {} CE:{:.4} GAP:{} HR:{:.0} {}",
                 indicator,
                 r.date,
                 r.ce,
