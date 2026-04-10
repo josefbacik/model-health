@@ -4,6 +4,7 @@ mod decompose;
 mod error;
 mod features;
 mod fetch;
+mod fitness;
 mod injury_risk;
 mod model;
 mod races;
@@ -98,6 +99,9 @@ enum Commands {
     /// signals with a tiered warning system (red / yellow / volume) based on
     /// historical injury-gap analysis.
     InjuryRisk,
+    /// Cardiac efficiency fitness report: grade-adjusted speed/HR trends,
+    /// current state, and training drivers.
+    Fitness,
 }
 
 #[tokio::main]
@@ -183,6 +187,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::InjuryRisk => {
             injury_risk::run(&config)?;
+        }
+        Commands::Fitness => {
+            fitness::run(&config)?;
         }
     }
 

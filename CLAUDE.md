@@ -145,6 +145,7 @@ predict [--target TARGET]  # predict using latest model
 races                      # race retrospectives + good-vs-bad contrast
 decompose                  # OLS decomposition of stress/RHR into training vs life
 injury-risk                # tiered warning system (red/yellow/volume)
+fitness                    # cardiac efficiency report (grade-adjusted speed/HR)
 ```
 
 **ML targets:** next_day_resting_hr (default), next_day_sleep_hours, next_day_steps, next_day_hrv
