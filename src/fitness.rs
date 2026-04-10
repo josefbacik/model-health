@@ -49,6 +49,110 @@ const RECENT_RUNS: usize = 10;
 /// terrain are typically 5-7.5% (hills affect speed but not HR as much).
 const MAX_HR_CV_PCT: f64 = 8.5;
 
+/// Per-second row of processed running data (post-warmup, filtered, grade-adjusted).
+struct SteadyRow {
+    elapsed: f64,
+    gap_speed: f64,
+    heart_rate: f64,
+    temperature: Option<f64>,
+    cadence: Option<f64>,
+    gct: Option<f64>,
+    stride: Option<f64>,
+}
+
+/// Load a detail parquet and extract filtered, grade-adjusted per-second rows.
+/// Handles altitude smoothing, warmup exclusion, speed/HR filtering, and
+/// Minetti grade adjustment. Returns None if the file lacks required columns
+/// or has too little data.
+fn load_steady_rows(detail_path: &std::path::Path) -> Option<Vec<SteadyRow>> {
+    let df = LazyFrame::scan_parquet(detail_path.to_string_lossy().as_ref(), Default::default())
+        .ok()?
+        .collect()
+        .ok()?;
+
+    if df.height() < 60 {
+        return None;
+    }
+
+    let col_f64 =
+        |name: &str| -> Option<Column> { df.column(name).ok()?.cast(&DataType::Float64).ok() };
+
+    // Required columns
+    let altitude = col_f64("altitude")?;
+    let distance = col_f64("distance")?;
+    let speed = col_f64("speed")?;
+    let hr = col_f64("heart_rate")?;
+    let elapsed = col_f64("elapsed_sec")?;
+
+    // Optional columns
+    let temperature = col_f64("temperature");
+    let cadence = col_f64("cadence");
+    let gct = col_f64("ground_contact_time");
+    let stride = col_f64("stride_length");
+
+    let alt_f = altitude.f64().ok()?;
+    let dist_f = distance.f64().ok()?;
+    let speed_f = speed.f64().ok()?;
+    let hr_f = hr.f64().ok()?;
+    let elapsed_f = elapsed.f64().ok()?;
+    let temp_f = temperature.as_ref().and_then(|c| c.f64().ok());
+    let cadence_f = cadence.as_ref().and_then(|c| c.f64().ok());
+    let gct_f = gct.as_ref().and_then(|c| c.f64().ok());
+    let stride_f = stride.as_ref().and_then(|c| c.f64().ok());
+
+    let n = df.height();
+
+    // Smoothed altitude (15-sec rolling mean)
+    let mut alt_smooth = vec![0.0f64; n];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        let start = i.saturating_sub(7);
+        let end = (i + 8).min(n);
+        let mut sum = 0.0;
+        let mut count = 0;
+        for j in start..end {
+            if let Some(a) = alt_f.get(j) {
+                sum += a;
+                count += 1;
+            }
+        }
+        alt_smooth[i] = if count > 0 { sum / count as f64 } else { 0.0 };
+    }
+
+    let mut rows = Vec::new();
+    for i in 1..n {
+        let Some(spd) = speed_f.get(i) else { continue };
+        let Some(heart) = hr_f.get(i) else { continue };
+        let Some(el) = elapsed_f.get(i) else { continue };
+        if el < WARMUP_SECONDS || spd < MIN_SPEED || heart < MIN_HR {
+            continue;
+        }
+        let d_dist = match (dist_f.get(i), dist_f.get(i - 1)) {
+            (Some(a), Some(b)) if (a - b) >= 1.0 => a - b,
+            _ => continue,
+        };
+        let d_alt = alt_smooth[i] - alt_smooth[i - 1];
+        let grade = (d_alt / d_dist).clamp(-0.45, 0.45);
+        let cost = minetti_cost(grade).max(1.0);
+
+        rows.push(SteadyRow {
+            elapsed: el,
+            gap_speed: spd * cost / FLAT_COST,
+            heart_rate: heart,
+            temperature: temp_f.and_then(|f| f.get(i)),
+            cadence: cadence_f.and_then(|f| f.get(i)),
+            gct: gct_f.and_then(|f| f.get(i)),
+            stride: stride_f.and_then(|f| f.get(i)),
+        });
+    }
+
+    if rows.len() < MIN_STEADY_SECONDS {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
 /// Minetti et al. (2002) metabolic cost of running as a function of grade.
 ///
 /// Returns cost in J/kg/m. Grade is fractional (0.05 = 5% uphill).
@@ -87,142 +191,25 @@ fn compute_run_ce(
     duration_min: f64,
     detail_path: &std::path::Path,
 ) -> Option<RunCE> {
-    let df = LazyFrame::scan_parquet(detail_path.to_string_lossy().as_ref(), Default::default())
-        .ok()?
-        .collect()
-        .ok()?;
+    let rows = load_steady_rows(detail_path)?;
 
-    if df.height() < 60 {
-        return None;
-    }
+    let n = rows.len();
+    let avg_gap = rows.iter().map(|r| r.gap_speed).sum::<f64>() / n as f64;
+    let avg_hr = rows.iter().map(|r| r.heart_rate).sum::<f64>() / n as f64;
 
-    // Helper to load a column as f64, returning None if missing
-    let col_f64 =
-        |name: &str| -> Option<Column> { df.column(name).ok()?.cast(&DataType::Float64).ok() };
-
-    // Required columns — skip this activity if any are missing
-    let altitude = col_f64("altitude")?;
-    let distance = col_f64("distance")?;
-    let speed = col_f64("speed")?;
-    let hr = col_f64("heart_rate")?;
-    let elapsed = col_f64("elapsed_sec")?;
-
-    // Optional columns — missing columns just mean those metrics are unavailable
-    let temperature = col_f64("temperature");
-    let cadence = col_f64("cadence");
-    let gct = col_f64("ground_contact_time");
-    let stride = col_f64("stride_length");
-
-    let alt_f = altitude.f64().ok()?;
-    let dist_f = distance.f64().ok()?;
-    let speed_f = speed.f64().ok()?;
-    let hr_f = hr.f64().ok()?;
-    let elapsed_f = elapsed.f64().ok()?;
-    let temp_f = temperature.as_ref().and_then(|c| c.f64().ok());
-    let cadence_f = cadence.as_ref().and_then(|c| c.f64().ok());
-    let gct_f = gct.as_ref().and_then(|c| c.f64().ok());
-    let stride_f = stride.as_ref().and_then(|c| c.f64().ok());
-
-    let n = df.height();
-
-    // Compute smoothed altitude (15-sec rolling mean) to reduce GPS/barometric
-    // noise before computing grade. Consumer watches have ~1-3m altitude noise,
-    // and at running pace (~3m/s) a 1-second interval only covers ~3m of distance,
-    // so wider smoothing is needed for stable grade estimates.
-    let mut alt_smooth = vec![0.0f64; n];
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n {
-        let start = i.saturating_sub(7);
-        let end = (i + 8).min(n);
-        let mut sum = 0.0;
-        let mut count = 0;
-        for j in start..end {
-            if let Some(a) = alt_f.get(j) {
-                sum += a;
-                count += 1;
-            }
+    let opt_mean = |f: fn(&SteadyRow) -> Option<f64>| -> Option<f64> {
+        let vals: Vec<f64> = rows.iter().filter_map(f).collect();
+        if vals.is_empty() {
+            None
+        } else {
+            Some(vals.iter().sum::<f64>() / vals.len() as f64)
         }
-        alt_smooth[i] = if count > 0 { sum / count as f64 } else { 0.0 };
-    }
-
-    // Accumulate steady-state values
-    let mut gap_speeds = Vec::new();
-    let mut hrs = Vec::new();
-    let mut temps = Vec::new();
-    let mut cadences = Vec::new();
-    let mut gcts = Vec::new();
-    let mut strides = Vec::new();
-
-    for i in 1..n {
-        let Some(spd) = speed_f.get(i) else {
-            continue;
-        };
-        let Some(heart) = hr_f.get(i) else { continue };
-        let Some(el) = elapsed_f.get(i) else { continue };
-
-        // Skip warmup, walking, HR dropouts
-        if el < WARMUP_SECONDS || spd < MIN_SPEED || heart < MIN_HR {
-            continue;
-        }
-
-        // Compute grade from smoothed altitude / distance delta
-        let d_alt = alt_smooth[i] - alt_smooth[i - 1];
-        let d_dist = match (dist_f.get(i), dist_f.get(i - 1)) {
-            (Some(a), Some(b)) if (a - b) >= 1.0 => a - b,
-            _ => continue, // skip rows with <1m distance change (noise)
-        };
-
-        let grade = (d_alt / d_dist).clamp(-0.45, 0.45);
-
-        // Smooth grade: use a 5-point running average
-        // For simplicity, we apply Minetti to per-second grade directly
-        // (the altitude smoothing already handles most noise)
-        let cost = minetti_cost(grade).max(1.0); // clamp cost floor
-        let gap_spd = spd * cost / FLAT_COST;
-
-        gap_speeds.push(gap_spd);
-        hrs.push(heart);
-
-        if let Some(t) = temp_f.and_then(|f| f.get(i)) {
-            temps.push(t);
-        }
-        if let Some(c) = cadence_f.and_then(|f| f.get(i)) {
-            cadences.push(c);
-        }
-        if let Some(g) = gct_f.and_then(|f| f.get(i)) {
-            gcts.push(g);
-        }
-        if let Some(s) = stride_f.and_then(|f| f.get(i)) {
-            strides.push(s);
-        }
-    }
-
-    if gap_speeds.len() < MIN_STEADY_SECONDS {
-        return None;
-    }
-
-    let avg_gap = gap_speeds.iter().sum::<f64>() / gap_speeds.len() as f64;
-    let avg_hr = hrs.iter().sum::<f64>() / hrs.len() as f64;
-    let avg_temp = if temps.is_empty() {
-        None
-    } else {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
     };
-    let avg_cadence = if cadences.is_empty() {
-        None
-    } else {
-        Some(cadences.iter().sum::<f64>() / cadences.len() as f64)
-    };
-    let avg_gct = if gcts.is_empty() {
-        None
-    } else {
-        Some(gcts.iter().sum::<f64>() / gcts.len() as f64)
-    };
-    let avg_stride = if strides.is_empty() {
-        None
-    } else {
-        Some(strides.iter().sum::<f64>() / strides.len() as f64)
-    };
+
+    let avg_temp = opt_mean(|r| r.temperature);
+    let avg_cadence = opt_mean(|r| r.cadence);
+    let avg_gct = opt_mean(|r| r.gct);
+    let avg_stride = opt_mean(|r| r.stride);
 
     let ce_raw = avg_gap / avg_hr;
     let ce = match avg_temp {
@@ -243,7 +230,7 @@ fn compute_run_ce(
         avg_cadence,
         avg_gct,
         avg_stride,
-        seconds_used: gap_speeds.len(),
+        seconds_used: n,
     })
 }
 
@@ -628,7 +615,6 @@ pub fn run(config: &Config) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Per-run cardiac drift result.
-#[allow(dead_code)]
 struct RunDrift {
     date: chrono::NaiveDate,
     distance_km: f64,
@@ -636,132 +622,57 @@ struct RunDrift {
     hr_drift_pct: f64,   // (HR_h2 - HR_h1) / HR_h1 * 100
     hr_h1: f64,
     hr_h2: f64,
-    gap_h1: f64,
-    gap_h2: f64,
-    avg_hr: f64,
     temp: Option<f64>,
+}
+
+/// Why a run was excluded from drift analysis.
+enum DriftSkip {
+    TooShort,
+    IntervalWorkout,
+    UnevenHalves,
 }
 
 /// Compute cardiac drift for a single activity.
 /// Splits the run into first and second halves (by elapsed time, post-warmup)
 /// and compares grade-adjusted efficiency between halves.
+/// Returns Ok(RunDrift) on success, or Err(DriftSkip) explaining why it was skipped.
 fn compute_run_drift(
     date: chrono::NaiveDate,
     distance_km: f64,
-    avg_hr_activity: f64,
     detail_path: &std::path::Path,
-) -> Option<RunDrift> {
-    let df = LazyFrame::scan_parquet(detail_path.to_string_lossy().as_ref(), Default::default())
-        .ok()?
-        .collect()
-        .ok()?;
-
-    if df.height() < 120 {
-        return None;
-    }
-
-    let col_f64 =
-        |name: &str| -> Option<Column> { df.column(name).ok()?.cast(&DataType::Float64).ok() };
-
-    let altitude = col_f64("altitude")?;
-    let distance = col_f64("distance")?;
-    let speed = col_f64("speed")?;
-    let hr = col_f64("heart_rate")?;
-    let elapsed = col_f64("elapsed_sec")?;
-    let temperature = col_f64("temperature");
-
-    let alt_f = altitude.f64().ok()?;
-    let dist_f = distance.f64().ok()?;
-    let speed_f = speed.f64().ok()?;
-    let hr_f = hr.f64().ok()?;
-    let elapsed_f = elapsed.f64().ok()?;
-    let temp_f = temperature.as_ref().and_then(|c| c.f64().ok());
-
-    let n = df.height();
-
-    // Smoothed altitude (15-sec window)
-    let mut alt_smooth = vec![0.0f64; n];
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n {
-        let start = i.saturating_sub(7);
-        let end = (i + 8).min(n);
-        let mut sum = 0.0;
-        let mut count = 0;
-        for j in start..end {
-            if let Some(a) = alt_f.get(j) {
-                sum += a;
-                count += 1;
-            }
-        }
-        alt_smooth[i] = if count > 0 { sum / count as f64 } else { 0.0 };
-    }
-
-    // Collect per-second (elapsed, gap_speed, hr) tuples
-    let mut rows: Vec<(f64, f64, f64)> = Vec::new();
-    let mut temps: Vec<f64> = Vec::new();
-
-    for i in 1..n {
-        let Some(spd) = speed_f.get(i) else { continue };
-        let Some(heart) = hr_f.get(i) else { continue };
-        let Some(el) = elapsed_f.get(i) else { continue };
-        if el < WARMUP_SECONDS || spd < MIN_SPEED || heart < MIN_HR {
-            continue;
-        }
-        let d_dist = match (dist_f.get(i), dist_f.get(i - 1)) {
-            (Some(a), Some(b)) if (a - b) >= 1.0 => a - b,
-            _ => continue,
-        };
-        let d_alt = alt_smooth[i] - alt_smooth[i - 1];
-        let grade = (d_alt / d_dist).clamp(-0.45, 0.45);
-        let cost = minetti_cost(grade).max(1.0);
-        let gap_spd = spd * cost / FLAT_COST;
-
-        rows.push((el, gap_spd, heart));
-        if let Some(t) = temp_f.and_then(|f| f.get(i)) {
-            temps.push(t);
-        }
-    }
+) -> std::result::Result<RunDrift, DriftSkip> {
+    let rows = load_steady_rows(detail_path).ok_or(DriftSkip::TooShort)?;
 
     if rows.len() < 60 {
-        return None;
+        return Err(DriftSkip::TooShort);
     }
 
-    // Skip interval workouts: HR coefficient of variation detects the
-    // hard/easy alternation pattern of structured intervals. Hills affect
-    // speed CV heavily but HR stays relatively steady on even-effort runs,
-    // so HR CV is a better discriminator than speed CV for hilly courses.
-    let hr_mean = rows.iter().map(|(_, _, h)| h).sum::<f64>() / rows.len() as f64;
+    // Skip interval workouts via HR coefficient of variation.
+    // Hills affect speed but HR stays steady on even-effort runs.
+    let hr_mean = rows.iter().map(|r| r.heart_rate).sum::<f64>() / rows.len() as f64;
     let hr_var = rows
         .iter()
-        .map(|(_, _, h)| (h - hr_mean).powi(2))
+        .map(|r| (r.heart_rate - hr_mean).powi(2))
         .sum::<f64>()
         / rows.len() as f64;
     let hr_cv = hr_var.sqrt() / hr_mean * 100.0;
     if hr_cv > MAX_HR_CV_PCT {
-        return None;
+        return Err(DriftSkip::IntervalWorkout);
     }
 
     // Split into halves by elapsed time
-    let mid_time = (rows.first().unwrap().0 + rows.last().unwrap().0) / 2.0;
-    let h1: Vec<(f64, f64)> = rows
-        .iter()
-        .filter(|(e, _, _)| *e < mid_time)
-        .map(|(_, g, h)| (*g, *h))
-        .collect();
-    let h2: Vec<(f64, f64)> = rows
-        .iter()
-        .filter(|(e, _, _)| *e >= mid_time)
-        .map(|(_, g, h)| (*g, *h))
-        .collect();
+    let mid_time = (rows.first().unwrap().elapsed + rows.last().unwrap().elapsed) / 2.0;
+    let h1: Vec<&SteadyRow> = rows.iter().filter(|r| r.elapsed < mid_time).collect();
+    let h2: Vec<&SteadyRow> = rows.iter().filter(|r| r.elapsed >= mid_time).collect();
 
     if h1.len() < 20 || h2.len() < 20 {
-        return None;
+        return Err(DriftSkip::UnevenHalves);
     }
 
-    let gap_h1 = h1.iter().map(|(g, _)| g).sum::<f64>() / h1.len() as f64;
-    let gap_h2 = h2.iter().map(|(g, _)| g).sum::<f64>() / h2.len() as f64;
-    let hr_h1 = h1.iter().map(|(_, h)| h).sum::<f64>() / h1.len() as f64;
-    let hr_h2 = h2.iter().map(|(_, h)| h).sum::<f64>() / h2.len() as f64;
+    let gap_h1 = h1.iter().map(|r| r.gap_speed).sum::<f64>() / h1.len() as f64;
+    let gap_h2 = h2.iter().map(|r| r.gap_speed).sum::<f64>() / h2.len() as f64;
+    let hr_h1 = h1.iter().map(|r| r.heart_rate).sum::<f64>() / h1.len() as f64;
+    let hr_h2 = h2.iter().map(|r| r.heart_rate).sum::<f64>() / h2.len() as f64;
 
     let ce_h1 = gap_h1 / hr_h1;
     let ce_h2 = gap_h2 / hr_h2;
@@ -769,22 +680,20 @@ fn compute_run_drift(
     let decoupling = (ce_h1 - ce_h2) / ce_h1 * 100.0;
     let hr_drift = (hr_h2 - hr_h1) / hr_h1 * 100.0;
 
+    let temps: Vec<f64> = rows.iter().filter_map(|r| r.temperature).collect();
     let avg_temp = if temps.is_empty() {
         None
     } else {
         Some(temps.iter().sum::<f64>() / temps.len() as f64)
     };
 
-    Some(RunDrift {
+    Ok(RunDrift {
         date,
         distance_km,
         decoupling_pct: decoupling,
         hr_drift_pct: hr_drift,
         hr_h1,
         hr_h2,
-        gap_h1,
-        gap_h2,
-        avg_hr: avg_hr_activity,
         temp: avg_temp,
     })
 }
@@ -798,8 +707,6 @@ pub fn drift(config: &Config) -> Result<()> {
             col("activity_id"),
             col("start_time_local"),
             col("distance_m"),
-            col("duration_sec"),
-            col("avg_hr"),
         ])
         .sort(["start_time_local"], Default::default())
         .collect()?;
@@ -813,12 +720,11 @@ pub fn drift(config: &Config) -> Result<()> {
     }
 
     let mut runs: Vec<RunDrift> = Vec::new();
+    let mut skipped_intervals = 0u32;
 
     let ids = activities.column("activity_id")?.i64()?;
     let times = activities.column("start_time_local")?.datetime()?;
     let dists = activities.column("distance_m")?.f64()?;
-    let hrs = activities.column("avg_hr")?.cast(&DataType::Float64)?;
-    let hr_f = hrs.f64()?;
 
     for i in 0..activities.height() {
         let Some(aid) = ids.get(i) else { continue };
@@ -829,15 +735,16 @@ pub fn drift(config: &Config) -> Result<()> {
             continue;
         };
         let dist_km = dists.get(i).unwrap_or(0.0) / 1000.0;
-        let avg_hr = hr_f.get(i).unwrap_or(0.0);
 
         let detail_path = details_dir.join(format!("{}.parquet", aid));
         if !detail_path.exists() {
             continue;
         }
 
-        if let Some(d) = compute_run_drift(date, dist_km, avg_hr, &detail_path) {
-            runs.push(d);
+        match compute_run_drift(date, dist_km, &detail_path) {
+            Ok(d) => runs.push(d),
+            Err(DriftSkip::IntervalWorkout) => skipped_intervals += 1,
+            Err(_) => {}
         }
     }
 
@@ -851,7 +758,16 @@ pub fn drift(config: &Config) -> Result<()> {
     println!("=== Cardiac Drift Report ===\n");
     println!("Decoupling = drop in pace:HR efficiency from 1st to 2nd half.");
     println!("Benchmark: <5% = strong aerobic base, 5-10% = normal, >10% = needs work");
-    println!("\nAnalyzed {} runs (5+ km with detail data).\n", runs.len());
+    let skipped_msg = if skipped_intervals > 0 {
+        format!(" ({} interval workouts excluded)", skipped_intervals)
+    } else {
+        String::new()
+    };
+    println!(
+        "\nAnalyzed {} steady runs (5+ km).{}\n",
+        runs.len(),
+        skipped_msg
+    );
 
     // Overall stats
     let all_dec: Vec<f64> = runs.iter().map(|r| r.decoupling_pct).collect();
