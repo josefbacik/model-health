@@ -43,6 +43,11 @@ const MIN_HR: f64 = 100.0;
 /// Number of recent runs to show individually in the report.
 const RECENT_RUNS: usize = 10;
 
+/// Maximum speed coefficient of variation (std/mean * 100) to consider a run
+/// "steady" for drift analysis. Interval workouts have large speed swings
+/// (CV > 10%) while steady runs are typically 5-8%.
+const MAX_SPEED_CV_PCT: f64 = 10.0;
+
 /// Minetti et al. (2002) metabolic cost of running as a function of grade.
 ///
 /// Returns cost in J/kg/m. Grade is fractional (0.05 = 5% uphill).
@@ -393,9 +398,11 @@ pub fn run(config: &Config) -> Result<()> {
     );
 
     // --- Recent runs ---
+    let mean_ce = all_ce.iter().sum::<f64>() / all_ce.len() as f64;
+
     println!("\n--- Last {} Runs ---\n", recent.len());
     println!(
-        "{:<12} {:>6} {:>7} {:>7} {:>5} {:>5} {:>6}",
+        "   {:<12}{:>6} {:>7} {:>7} {:>5} {:>5} {:>6}",
         "Date", "Dist", "CE", "GAP", "HR", "Temp", "Spm"
     );
     for r in recent {
@@ -407,8 +414,16 @@ pub fn run(config: &Config) -> Result<()> {
             .avg_cadence
             .map(|c| format!("{:.0}", c))
             .unwrap_or_else(|| "---".into());
+        let indicator = if r.ce >= mean_ce {
+            "\x1b[32m▲\x1b[0m" // green — above average
+        } else if r.ce >= mean_ce - 0.0015 {
+            "\x1b[33m-\x1b[0m" // yellow — slightly below
+        } else {
+            "\x1b[31m▼\x1b[0m" // red — well below average
+        };
         println!(
-            "{:<12} {:>5.1}k {:>7.4} {:>7} {:>5.0} {:>5} {:>6}",
+            " {} {:<12}{:>5.1}k {:>7.4} {:>7} {:>5.0} {:>5} {:>6}",
+            indicator,
             r.date,
             r.distance_km,
             r.ce,
@@ -682,6 +697,7 @@ fn compute_run_drift(
 
     // Collect per-second (elapsed, gap_speed, hr) tuples
     let mut rows: Vec<(f64, f64, f64)> = Vec::new();
+    let mut raw_speeds: Vec<f64> = Vec::new();
     let mut temps: Vec<f64> = Vec::new();
 
     for i in 1..n {
@@ -701,12 +717,26 @@ fn compute_run_drift(
         let gap_spd = spd * cost / FLAT_COST;
 
         rows.push((el, gap_spd, heart));
+        raw_speeds.push(spd);
         if let Some(t) = temp_f.and_then(|f| f.get(i)) {
             temps.push(t);
         }
     }
 
     if rows.len() < 60 {
+        return None;
+    }
+
+    // Skip interval workouts: high speed variance means structured intervals
+    // rather than steady running, which invalidates the half-split drift model.
+    let speed_mean = raw_speeds.iter().sum::<f64>() / raw_speeds.len() as f64;
+    let speed_var = raw_speeds
+        .iter()
+        .map(|s| (s - speed_mean).powi(2))
+        .sum::<f64>()
+        / raw_speeds.len() as f64;
+    let speed_cv = speed_var.sqrt() / speed_mean * 100.0;
+    if speed_cv > MAX_SPEED_CV_PCT {
         return None;
     }
 
@@ -911,13 +941,20 @@ pub fn drift(config: &Config) -> Result<()> {
     let recent = &runs[runs.len() - recent_n..];
     println!("\n--- Last {} Runs ---\n", recent_n);
     println!(
-        "{:>12} {:>6} {:>9} {:>7} {:>7} {:>6}",
+        "   {:>12} {:>6} {:>9} {:>7} {:>7} {:>6}",
         "Date", "Dist", "Decouple", "HR 1st", "HR 2nd", "Drift"
     );
     for r in recent {
+        let indicator = if r.decoupling_pct < 5.0 {
+            "\x1b[32m▲\x1b[0m" // green up — good
+        } else if r.decoupling_pct <= 10.0 {
+            "\x1b[33m-\x1b[0m" // yellow dash — maintaining
+        } else {
+            "\x1b[31m▼\x1b[0m" // red down — needs work
+        };
         println!(
-            "{:>12} {:>5.1}k {:>+8.1}% {:>7.0} {:>7.0} {:>+5.1}%",
-            r.date, r.distance_km, r.decoupling_pct, r.hr_h1, r.hr_h2, r.hr_drift_pct,
+            " {} {:>12} {:>5.1}k {:>+8.1}% {:>7.0} {:>7.0} {:>+5.1}%",
+            indicator, r.date, r.distance_km, r.decoupling_pct, r.hr_h1, r.hr_h2, r.hr_drift_pct,
         );
     }
 
