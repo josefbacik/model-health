@@ -39,6 +39,97 @@ fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     R * 2.0 * a.sqrt().asin()
 }
 
+/// Reverse-geocode a lat/lon to a short place name via OpenStreetMap Nominatim.
+/// Returns something like "Kingpost Dr, Sunset Lake" or "Bass Lake Rd, Holly Springs".
+/// Falls back to the Garmin location_name if the lookup fails.
+fn reverse_geocode(lat: f64, lon: f64) -> Option<String> {
+    let url = format!(
+        "https://nominatim.openstreetmap.org/reverse?lat={}&lon={}&format=json&zoom=16&addressdetails=1",
+        lat, lon
+    );
+
+    let body = ureq::get(&url)
+        .header("User-Agent", "model-health/0.1")
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
+
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let addr = json.get("address")?;
+
+    let road = addr.get("road").and_then(|v| v.as_str()).unwrap_or("");
+    let neighbourhood = addr
+        .get("neighbourhood")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let town = addr
+        .get("town")
+        .or_else(|| addr.get("city"))
+        .or_else(|| addr.get("county"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Build a short name: prefer road + neighbourhood, fall back to road + town
+    let name = if !road.is_empty() && !neighbourhood.is_empty() {
+        format!("{}, {}", road, neighbourhood)
+    } else if !road.is_empty() && !town.is_empty() {
+        format!("{}, {}", road, town)
+    } else if !road.is_empty() {
+        road.to_string()
+    } else if !neighbourhood.is_empty() {
+        neighbourhood.to_string()
+    } else {
+        town.to_string()
+    };
+
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Load or build a geocode cache (maps "lat,lon" -> name).
+/// Stored as a simple JSON file in the data directory.
+fn load_geocode_cache(config: &Config) -> HashMap<String, String> {
+    let path = config.data_dir.join("geocode_cache.json");
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        HashMap::new()
+    }
+}
+
+fn save_geocode_cache(config: &Config, cache: &HashMap<String, String>) {
+    let path = config.data_dir.join("geocode_cache.json");
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Get a human-readable name for a route's start coordinates.
+/// Uses a disk cache to avoid redundant API calls.
+fn get_route_name(
+    lat: f64,
+    lon: f64,
+    fallback: &str,
+    cache: &mut HashMap<String, String>,
+) -> String {
+    // Round to 3 decimal places (~100m) for cache key
+    let key = format!("{:.3},{:.3}", lat, lon);
+
+    if let Some(name) = cache.get(&key) {
+        return name.clone();
+    }
+
+    if let Some(name) = reverse_geocode(lat, lon) {
+        cache.insert(key, name.clone());
+        // Brief sleep to respect Nominatim's 1 req/sec policy
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        name
+    } else {
+        fallback.to_string()
+    }
+}
+
 /// A detected route (cluster of runs from the same start with similar distance).
 struct Route {
     start_lat: f64,
@@ -252,7 +343,45 @@ pub fn run(config: &Config, show_all: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Phase 3: Report
+    // Phase 3: Geocode route start points
+    let mut geo_cache = load_geocode_cache(config);
+    let need_geocode = routes
+        .iter()
+        .filter(|r| {
+            let key = format!("{:.3},{:.3}", r.start_lat, r.start_lon);
+            !geo_cache.contains_key(&key)
+        })
+        .count();
+    if need_geocode > 0 {
+        println!(
+            "Looking up {} route location{}...",
+            need_geocode,
+            if need_geocode == 1 { "" } else { "s" }
+        );
+    }
+
+    // Pre-resolve all route names (may make network calls for uncached ones)
+    let route_names: Vec<String> = routes
+        .iter()
+        .map(|route| {
+            let fallback_name = route
+                .runs
+                .iter()
+                .map(|r| r.location_name.as_str())
+                .find(|n| !n.is_empty() && *n != "null")
+                .unwrap_or("Unknown");
+            get_route_name(
+                route.start_lat,
+                route.start_lon,
+                fallback_name,
+                &mut geo_cache,
+            )
+        })
+        .collect();
+
+    save_geocode_cache(config, &geo_cache);
+
+    // Phase 4: Report
     println!("=== Route Fitness Report ===\n");
     if show_all {
         println!(
@@ -270,17 +399,7 @@ pub fn run(config: &Config, show_all: bool) -> Result<()> {
 
     for (idx, route) in routes.iter().enumerate() {
         let runs = &route.runs;
-
-        // Most common location name
-        let mut name_counts: HashMap<&str, usize> = HashMap::new();
-        for r in runs {
-            *name_counts.entry(&r.location_name).or_default() += 1;
-        }
-        let route_name = name_counts
-            .into_iter()
-            .max_by_key(|(_, c)| *c)
-            .map(|(n, _)| n)
-            .unwrap_or("Unknown");
+        let route_name = &route_names[idx];
 
         let avg_dist = runs.iter().map(|r| r.distance_km).sum::<f64>() / runs.len() as f64;
         let first_date = runs.iter().map(|r| r.date).min().unwrap();
