@@ -148,6 +148,7 @@ injury-risk                # tiered warning system (red/yellow/volume)
 fitness                    # cardiac efficiency report (grade-adjusted speed/HR)
 drift                      # cardiac drift analysis (1st vs 2nd half decoupling)
 routes                     # GPS-based route detection + per-route CE tracking
+readiness                  # recovery-based readiness score + expected CE
 ```
 
 **ML targets:** next_day_resting_hr (default), next_day_sleep_hours, next_day_steps, next_day_hrv

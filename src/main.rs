@@ -8,6 +8,7 @@ mod fitness;
 mod injury_risk;
 mod model;
 mod races;
+mod readiness;
 mod routes;
 mod sync;
 mod validation;
@@ -106,6 +107,9 @@ enum Commands {
     /// Cardiac drift analysis: how much does pace:HR efficiency drop from
     /// the first to second half of each run? Lower drift = better aerobic base.
     Drift,
+    /// Recovery-based readiness score: compares today's body battery, RHR,
+    /// sleep, and stress against your baselines, then predicts expected CE.
+    Readiness,
     /// Route-based fitness tracking: identifies common routes via GPS and
     /// tracks cardiac efficiency on each route over time. By default shows
     /// only routes with recent runs; use --all to see all detected routes.
@@ -205,6 +209,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Drift => {
             fitness::drift(&config)?;
+        }
+        Commands::Readiness => {
+            readiness::run(&config)?;
         }
         Commands::Routes { all } => {
             routes::run(&config, all)?;
