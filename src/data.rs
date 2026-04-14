@@ -67,6 +67,11 @@ pub fn load_blood_pressure(config: &Config) -> Result<LazyFrame> {
     scan_entity(&config.garmin_storage_path, "blood_pressure")
 }
 
+/// Load daily nutrition / food logging summaries as a LazyFrame.
+pub fn load_nutrition(config: &Config) -> Result<LazyFrame> {
+    scan_entity(&config.garmin_storage_path, "nutrition")
+}
+
 /// Load per-activity time-series detail data as a LazyFrame.
 #[allow(dead_code)]
 pub fn load_activity_details(config: &Config) -> Result<LazyFrame> {
@@ -146,6 +151,7 @@ pub fn profile_data(config: &Config) -> Result<()> {
         ("Activities", load_activities),
         ("Weight", load_weight),
         ("Blood Pressure", load_blood_pressure),
+        ("Nutrition", load_nutrition),
     ] {
         match loader(config) {
             Ok(lf) => {

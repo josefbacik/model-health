@@ -47,7 +47,7 @@ const RECENT_RUNS: usize = 10;
 /// a run "steady" for drift analysis. Interval workouts produce large HR
 /// swings (CV > 8.5%) from hard/easy alternation, while steady runs on hilly
 /// terrain are typically 5-7.5% (hills affect speed but not HR as much).
-const MAX_HR_CV_PCT: f64 = 8.5;
+pub const MAX_HR_CV_PCT: f64 = 8.5;
 
 /// Per-second row of processed running data (post-warmup, filtered, grade-adjusted).
 pub struct SteadyRow {
@@ -167,24 +167,24 @@ const FLAT_COST: f64 = 3.6; // minetti_cost(0.0)
 
 /// Per-run cardiac efficiency result.
 #[allow(dead_code)]
-struct RunCE {
-    activity_id: i64,
-    date: chrono::NaiveDate,
-    distance_km: f64,
-    duration_min: f64,
-    ce: f64,        // temperature-adjusted cardiac efficiency
-    ce_raw: f64,    // raw CE before temp adjustment
-    gap_speed: f64, // average grade-adjusted speed (m/s)
-    avg_hr: f64,    // average HR during steady state
-    avg_temp: Option<f64>,
-    avg_cadence: Option<f64>,
-    avg_gct: Option<f64>,
-    avg_stride: Option<f64>,
-    seconds_used: usize, // how many seconds of data contributed
+pub struct RunCE {
+    pub activity_id: i64,
+    pub date: chrono::NaiveDate,
+    pub distance_km: f64,
+    pub duration_min: f64,
+    pub ce: f64,        // temperature-adjusted cardiac efficiency
+    pub ce_raw: f64,    // raw CE before temp adjustment
+    pub gap_speed: f64, // average grade-adjusted speed (m/s)
+    pub avg_hr: f64,    // average HR during steady state
+    pub avg_temp: Option<f64>,
+    pub avg_cadence: Option<f64>,
+    pub avg_gct: Option<f64>,
+    pub avg_stride: Option<f64>,
+    pub seconds_used: usize, // how many seconds of data contributed
 }
 
 /// Compute cardiac efficiency for a single activity from its detail parquet.
-fn compute_run_ce(
+pub fn compute_run_ce(
     activity_id: i64,
     date: chrono::NaiveDate,
     distance_km: f64,
@@ -615,18 +615,18 @@ pub fn run(config: &Config) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Per-run cardiac drift result.
-struct RunDrift {
-    date: chrono::NaiveDate,
-    distance_km: f64,
-    decoupling_pct: f64, // (CE_h1 - CE_h2) / CE_h1 * 100; positive = normal drift
-    hr_drift_pct: f64,   // (HR_h2 - HR_h1) / HR_h1 * 100
-    hr_h1: f64,
-    hr_h2: f64,
-    temp: Option<f64>,
+pub struct RunDrift {
+    pub date: chrono::NaiveDate,
+    pub distance_km: f64,
+    pub decoupling_pct: f64, // (CE_h1 - CE_h2) / CE_h1 * 100; positive = normal drift
+    pub hr_drift_pct: f64,   // (HR_h2 - HR_h1) / HR_h1 * 100
+    pub hr_h1: f64,
+    pub hr_h2: f64,
+    pub temp: Option<f64>,
 }
 
 /// Why a run was excluded from drift analysis.
-enum DriftSkip {
+pub enum DriftSkip {
     TooShort,
     IntervalWorkout,
     UnevenHalves,
@@ -636,7 +636,7 @@ enum DriftSkip {
 /// Splits the run into first and second halves (by elapsed time, post-warmup)
 /// and compares grade-adjusted efficiency between halves.
 /// Returns Ok(RunDrift) on success, or Err(DriftSkip) explaining why it was skipped.
-fn compute_run_drift(
+pub fn compute_run_drift(
     date: chrono::NaiveDate,
     distance_km: f64,
     detail_path: &std::path::Path,

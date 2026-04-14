@@ -32,6 +32,7 @@ Primary date column: `date` (Date)
 | avg_spo2, lowest_spo2 | i32 | |
 | hydration_ml | i32 | |
 | moderate_intensity_min, vigorous_intensity_min | i32 | |
+| consumed_calories | i32 | From daily summary `consumedKilocalories`; often null — prefer `nutrition` table |
 
 ### performance_metrics (monthly partitioned, same date range as daily_health)
 Primary date column: `date` (Date)
@@ -77,6 +78,19 @@ Primary date column: `date` (Date)
 
 Columns: systolic, diastolic, pulse (i32), category (i32), category_name (String),
 notes (String), timestamp_gmt, timestamp_local (String)
+
+### nutrition (monthly partitioned, sparse — only days with food logged)
+Primary date column: `date` (Date)
+
+Canonical source for food intake data. The `consumed_calories` column in
+`daily_health` comes from a different endpoint and is often null; prefer this table.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| consumed_calories | i32 | Total logged food calories |
+| protein_g | f64 | Grams of protein |
+| carbs_g | f64 | Grams of carbohydrates |
+| fat_g | f64 | Grams of fat |
 
 ### activity_details (per-activity partitioned, many rows per activity)
 Primary key: `activity_id` (i64) — one parquet file per activity.
@@ -135,7 +149,7 @@ Legacy GPS-only data from the old garmin-cli tool. Superseded by
 
 ```
 fetch --from DATE [--to DATE] [--force] [--only <category>]
-    Categories: daily-health, weight-bp, activities, activity-details
+    Categories: daily-health, weight-bp, activities, activity-details, nutrition
 probe --date DATE          # dump raw Garmin JSON (debugging)
 probe-activity --id ID     # dump detail + splits JSON for one activity
 status                     # data coverage summary
@@ -149,6 +163,7 @@ fitness                    # cardiac efficiency report (grade-adjusted speed/HR)
 drift                      # cardiac drift analysis (1st vs 2nd half decoupling)
 routes                     # GPS-based route detection + per-route CE tracking
 readiness                  # recovery-based readiness score + expected CE
+recap                      # post-run breakdown of most recent activity
 ```
 
 **ML targets:** next_day_resting_hr (default), next_day_sleep_hours, next_day_steps, next_day_hrv

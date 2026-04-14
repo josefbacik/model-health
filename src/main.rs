@@ -9,6 +9,7 @@ mod injury_risk;
 mod model;
 mod races;
 mod readiness;
+mod recap;
 mod routes;
 mod sync;
 mod validation;
@@ -53,6 +54,7 @@ enum Commands {
         ///   weight-bp         monthly weight + blood pressure (fast)
         ///   activities        paginated activity list (fast)
         ///   activity-details  per-activity time-series + splits (slow for backfill)
+        ///   nutrition         daily food log / macro summary (fast)
         ///
         /// Example: `model-health fetch --from 2017-01-01 --force --only activities`
         #[arg(long, value_enum)]
@@ -118,6 +120,10 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Post-run recap: comprehensive breakdown of your most recent activity
+    /// including CE, drift, splits, recovery context, comparison to similar
+    /// runs, and fitness trend.
+    Recap,
 }
 
 #[tokio::main]
@@ -168,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                     "date",
                     Box::new(data::load_blood_pressure),
                 ),
+                ("Nutrition", "date", Box::new(data::load_nutrition)),
             ];
 
             for (name, date_col, loader) in &datasets {
@@ -215,6 +222,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Routes { all } => {
             routes::run(&config, all)?;
+        }
+        Commands::Recap => {
+            recap::run(&config)?;
         }
     }
 

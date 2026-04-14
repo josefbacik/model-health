@@ -33,6 +33,8 @@ pub enum FetchCategory {
     /// Activity details + splits (per-activity fetch, slow for backfill).
     /// Requires activities to be fetched first.
     ActivityDetails,
+    /// Nutrition / food logging (per-day fetch, fast — only days with data).
+    Nutrition,
 }
 
 impl FetchCategory {
@@ -88,6 +90,13 @@ pub async fn fetch_all(
         fetch_activity_details_and_splits(config, &client, force).await?;
     } else {
         println!("Skipping activity details (not selected by --only).");
+    }
+
+    // Nutrition / food logging: per-day fetch of daily macro summary.
+    if FetchCategory::Nutrition.is_enabled(only) {
+        fetch_nutrition(config, &client, from, to, force).await?;
+    } else {
+        println!("Skipping nutrition (not selected by --only).");
     }
 
     Ok(())
@@ -1443,17 +1452,33 @@ fn write_or_merge_parquet(
         let existing =
             LazyFrame::scan_parquet(path.to_string_lossy().as_ref(), Default::default())?
                 .collect()?;
-        // Select only the columns present in new_data to handle schema differences
-        // (e.g., garmin-cli wrote extra columns like id, profile_id, raw_json)
+        // Align schemas: select columns present in new_data, adding null
+        // columns for any that exist in new_data but not in the old file
+        // (e.g., newly added fields like consumed_calories).
         let our_cols: Vec<String> = new_data
             .get_column_names()
             .into_iter()
             .map(|s| s.to_string())
             .collect();
-        let existing_aligned = existing
-            .lazy()
-            .select(our_cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>())
-            .collect()?;
+        let existing_col_names: HashSet<String> = existing
+            .get_column_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let select_exprs: Vec<Expr> = our_cols
+            .iter()
+            .map(|c| {
+                if existing_col_names.contains(c) {
+                    col(c.as_str())
+                } else {
+                    // New column not in old file — fill with null, matching the
+                    // dtype from new_data so vstack succeeds.
+                    let dtype = new_data.column(c).unwrap().dtype().clone();
+                    lit(NULL).cast(dtype).alias(c)
+                }
+            })
+            .collect();
+        let existing_aligned = existing.lazy().select(select_exprs).collect()?;
         let combined = existing_aligned.vstack(&new_data)?;
         combined
             .lazy()
@@ -1507,6 +1532,7 @@ fn health_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> {
     let mut hydration = Vec::new();
     let mut mod_min = Vec::new();
     let mut vig_min = Vec::new();
+    let mut consumed_cal = Vec::new();
 
     for r in records {
         dates.push(r["_date"].as_str().unwrap_or("").to_string());
@@ -1538,6 +1564,7 @@ fn health_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> {
         hydration.push(oi32(r, "hydration_ml"));
         mod_min.push(oi32(r, "moderate_intensity_min"));
         vig_min.push(oi32(r, "vigorous_intensity_min"));
+        consumed_cal.push(oi32(r, "consumed_calories"));
     }
 
     let date_series: Vec<Option<NaiveDate>> = dates
@@ -1571,6 +1598,7 @@ fn health_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> {
         "hydration_ml" => &hydration,
         "moderate_intensity_min" => &mod_min,
         "vigorous_intensity_min" => &vig_min,
+        "consumed_calories" => &consumed_cal,
     )?;
 
     Ok(df)
@@ -1872,6 +1900,7 @@ async fn fetch_daily_health(
         "hydration_ml": serde_json::Value::Null,
         "moderate_intensity_min": ji32(&health, "moderateIntensityMinutes"),
         "vigorous_intensity_min": ji32(&health, "vigorousIntensityMinutes"),
+        "consumed_calories": ji32(&health, "consumedKilocalories"),
     }))
 }
 
@@ -2276,6 +2305,169 @@ fn bp_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> {
         "notes" => &notes,
         "source_type" => &source,
         "version" => &version,
+    )?;
+
+    Ok(df)
+}
+
+// ---------------------------------------------------------------------------
+// Nutrition / food logging
+// ---------------------------------------------------------------------------
+
+/// Fetch daily nutrition summaries for the requested date range.
+/// Uses a per-day loop similar to daily health, but only stores the daily
+/// macro totals (calories, protein, carbs, fat) — not individual food entries.
+async fn fetch_nutrition(
+    config: &Config,
+    client: &Client,
+    from: NaiveDate,
+    to: NaiveDate,
+    force: bool,
+) -> Result<()> {
+    let existing = if force {
+        HashSet::new()
+    } else {
+        load_existing_dates(config, "nutrition")?
+    };
+
+    let today = Utc::now().date_naive();
+    let mut date = from;
+    let total_days = (to - from).num_days() + 1;
+    let mut processed = 0i64;
+    let mut total_records = 0usize;
+    let mut errors = 0usize;
+    let mut skipped = 0usize;
+    let started = Instant::now();
+
+    // Accumulate records per month, then flush.
+    let mut current_month: Option<(i32, u32)> = None;
+    let mut month_records: Vec<serde_json::Value> = Vec::new();
+
+    println!("Fetching nutrition ({} days)...", total_days);
+
+    while date <= to {
+        let ym = (date.year(), date.month());
+        let is_today = date == today;
+
+        // Flush previous month when we cross a boundary.
+        if let Some(prev) = current_month
+            && prev != ym
+            && !month_records.is_empty()
+        {
+            let partition = format!("{:04}-{:02}", prev.0, prev.1);
+            let df = nutrition_records_to_df(&month_records)?;
+            write_parquet_partition(config, "nutrition", &partition, df, &["date"])?;
+            month_records.clear();
+        }
+        current_month = Some(ym);
+
+        if !is_today && existing.contains(&date) {
+            skipped += 1;
+        } else {
+            match fetch_nutrition_day(client, date).await {
+                Ok(Some(record)) => {
+                    total_records += 1;
+                    month_records.push(record);
+                }
+                Ok(None) => {} // no food logged that day
+                Err(e) => {
+                    eprintln!("  Nutrition {}: {}", date, e);
+                    errors += 1;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        processed += 1;
+        if processed % 30 == 0 || date == to {
+            let (elapsed, eta) = elapsed_and_eta(started, processed, total_days);
+            println!(
+                "  {}: {}/{} days, {} records, {} skipped  [{} elapsed, {} ETA]",
+                date, processed, total_days, total_records, skipped, elapsed, eta,
+            );
+        }
+
+        date += Duration::days(1);
+    }
+
+    // Flush remaining month.
+    if let Some(ym) = current_month
+        && !month_records.is_empty()
+    {
+        let partition = format!("{:04}-{:02}", ym.0, ym.1);
+        let df = nutrition_records_to_df(&month_records)?;
+        write_parquet_partition(config, "nutrition", &partition, df, &["date"])?;
+    }
+
+    println!("Nutrition: {} records, {} errors.", total_records, errors);
+    Ok(())
+}
+
+/// Fetch the daily nutrition summary for a single date.
+/// Returns None if no food was logged that day (404 or empty data).
+async fn fetch_nutrition_day(
+    client: &Client,
+    date: NaiveDate,
+) -> Result<Option<serde_json::Value>> {
+    let path = format!("/nutrition-service/food/logs/{}", date);
+    let data: serde_json::Value = match client.get_json(&path).await {
+        Ok(d) => d,
+        Err(garmin_connect::Error::NotFound(_)) => return Ok(None),
+        Err(garmin_connect::Error::Api { status: 405, .. }) => return Ok(None),
+        Err(e) => return Err(AppError::Sync(e.to_string())),
+    };
+
+    let daily = match data.get("dailyNutritionContent") {
+        Some(d) if d.is_object() => d,
+        _ => return Ok(None),
+    };
+
+    let calories = daily
+        .get("calories")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    // If no calories logged, treat as no data for the day.
+    if calories.is_none() || calories == Some(0) {
+        return Ok(None);
+    }
+
+    Ok(Some(serde_json::json!({
+        "_date": date.to_string(),
+        "consumed_calories": calories,
+        "protein_g": daily.get("protein").and_then(|v| v.as_f64()),
+        "carbs_g": daily.get("carbs").and_then(|v| v.as_f64()),
+        "fat_g": daily.get("fat").and_then(|v| v.as_f64()),
+    })))
+}
+
+/// Convert a batch of nutrition JSON records into a DataFrame.
+fn nutrition_records_to_df(records: &[serde_json::Value]) -> Result<DataFrame> {
+    let mut dates = Vec::new();
+    let mut consumed_cal = Vec::new();
+    let mut protein = Vec::new();
+    let mut carbs = Vec::new();
+    let mut fat = Vec::new();
+
+    for r in records {
+        dates.push(r["_date"].as_str().unwrap_or("").to_string());
+        consumed_cal.push(oi32(r, "consumed_calories"));
+        protein.push(r.get("protein_g").and_then(|v| v.as_f64()));
+        carbs.push(r.get("carbs_g").and_then(|v| v.as_f64()));
+        fat.push(r.get("fat_g").and_then(|v| v.as_f64()));
+    }
+
+    let date_series: Vec<Option<NaiveDate>> = dates
+        .iter()
+        .map(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .collect();
+
+    let df = df!(
+        "date" => &date_series,
+        "consumed_calories" => &consumed_cal,
+        "protein_g" => &protein,
+        "carbs_g" => &carbs,
+        "fat_g" => &fat,
     )?;
 
     Ok(df)
