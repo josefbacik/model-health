@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::NaiveDate;
 use polars::prelude::*;
@@ -21,6 +22,77 @@ pub fn dir_has_parquet(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Promote two numeric DataTypes to their common supertype.
+/// Returns None for incompatible types (e.g. String vs Int32).
+fn numeric_supertype(a: &DataType, b: &DataType) -> Option<DataType> {
+    use DataType::*;
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        // Integer widening
+        (Int8, Int16) | (Int16, Int8) => Some(Int16),
+        (Int8 | Int16, Int32) | (Int32, Int8 | Int16) => Some(Int32),
+        (Int8 | Int16 | Int32, Int64) | (Int64, Int8 | Int16 | Int32) => Some(Int64),
+        // Float widening
+        (Float32, Float64) | (Float64, Float32) => Some(Float64),
+        // Int -> Float promotion
+        (Int8 | Int16 | Int32, Float32) | (Float32, Int8 | Int16 | Int32) => Some(Float64),
+        (Int8 | Int16 | Int32 | Int64, Float64) | (Float64, Int8 | Int16 | Int32 | Int64) => {
+            Some(Float64)
+        }
+        (Int64, Float32) | (Float32, Int64) => Some(Float64),
+        _ => None,
+    }
+}
+
+/// Build a union schema from all parquet files in a directory.
+///
+/// When parquet files are written over time, newer files may contain columns
+/// that older files lack (e.g. `consumed_calories` added to daily_health).
+/// Polars' `allow_missing_columns` handles files *missing* columns from the
+/// resolved schema, but errors on files with *extra* columns.  By reading
+/// each file's metadata and merging into a superset schema we ensure every
+/// column is known up-front.
+fn union_schema(dir: &Path) -> Result<SchemaRef> {
+    let mut schema = Schema::default();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| AppError::Data(format!("Cannot read {}: {e}", dir.display())))?
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("parquet"))
+        .collect();
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
+        let file_schema = LazyFrame::scan_parquet(&path_str, Default::default())
+            .and_then(|mut lf| lf.collect_schema())
+            .map_err(|e| {
+                AppError::Data(format!("Cannot read schema of {}: {e}", path.display()))
+            })?;
+        for (name, dtype) in file_schema.iter() {
+            match schema.get(name.as_str()) {
+                Some(existing) if existing != dtype => {
+                    let super_type = numeric_supertype(existing, dtype).ok_or_else(|| {
+                        AppError::Data(format!(
+                            "Column '{}' has conflicting types: {} vs {}",
+                            name, existing, dtype
+                        ))
+                    })?;
+                    schema.with_column(name.clone(), super_type);
+                }
+                None => {
+                    schema.with_column(name.clone(), dtype.clone());
+                }
+                _ => {} // same type, nothing to do
+            }
+        }
+    }
+
+    Ok(Arc::new(schema))
+}
+
 /// Load Parquet files for a given entity type from garmin-cli's storage.
 fn scan_entity(base_path: &Path, entity_dir: &str) -> Result<LazyFrame> {
     let dir = base_path.join(entity_dir);
@@ -31,11 +103,14 @@ fn scan_entity(base_path: &Path, entity_dir: &str) -> Result<LazyFrame> {
         )));
     }
 
+    let schema = union_schema(&dir)?;
+
     let pattern = dir.join("*.parquet");
     let pattern_str = pattern.to_string_lossy().to_string();
 
     let args = ScanArgsParquet {
         allow_missing_columns: true,
+        schema: Some(schema),
         ..Default::default()
     };
     LazyFrame::scan_parquet(&pattern_str, args)
@@ -310,6 +385,114 @@ pub fn summarize(lf: LazyFrame, date_col: &str) -> Result<DataSummary> {
         min_date,
         max_date,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a DataFrame to a parquet file.
+    fn write_parquet(df: &mut DataFrame, path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        ParquetWriter::new(file).finish(df).unwrap();
+    }
+
+    #[test]
+    fn scan_entity_with_extra_columns_in_newer_file() {
+        // Simulate the bug: older files have {date, steps}, newer file adds {consumed_calories}.
+        // Without the union_schema fix, this would fail with
+        // "parquet file contained extra columns and no selection was given".
+        let tmp = tempfile::tempdir().unwrap();
+        let entity_dir = tmp.path().join("daily_health");
+        std::fs::create_dir_all(&entity_dir).unwrap();
+
+        // Older file: date + steps only
+        let mut old = df![
+            "date" => &["2025-01-01", "2025-01-02"],
+            "steps" => &[5000i32, 6000],
+        ]
+        .unwrap();
+        write_parquet(&mut old, &entity_dir.join("2025-01.parquet"));
+
+        // Newer file: date + steps + consumed_calories (extra column)
+        let mut new = df![
+            "date" => &["2026-04-01"],
+            "steps" => &[7000i32],
+            "consumed_calories" => &[2100i32],
+        ]
+        .unwrap();
+        write_parquet(&mut new, &entity_dir.join("2026-04.parquet"));
+
+        // This must succeed — the old behavior would error here.
+        let lf = scan_entity(tmp.path(), "daily_health").unwrap();
+        let result = lf.collect().unwrap();
+
+        assert_eq!(result.height(), 3);
+        assert!(result.schema().contains("consumed_calories"));
+        assert!(result.schema().contains("steps"));
+
+        // Old rows should have null for consumed_calories
+        let cc = result.column("consumed_calories").unwrap();
+        assert_eq!(cc.null_count(), 2);
+    }
+
+    #[test]
+    fn scan_entity_uniform_schema() {
+        // When all files share the same schema, everything should work as before.
+        let tmp = tempfile::tempdir().unwrap();
+        let entity_dir = tmp.path().join("test_entity");
+        std::fs::create_dir_all(&entity_dir).unwrap();
+
+        let mut a = df!["id" => &[1i32, 2], "val" => &[10i32, 20]].unwrap();
+        let mut b = df!["id" => &[3i32], "val" => &[30i32]].unwrap();
+        write_parquet(&mut a, &entity_dir.join("a.parquet"));
+        write_parquet(&mut b, &entity_dir.join("b.parquet"));
+
+        let lf = scan_entity(tmp.path(), "test_entity").unwrap();
+        let result = lf.collect().unwrap();
+        assert_eq!(result.height(), 3);
+    }
+
+    #[test]
+    fn scan_entity_missing_dir_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = scan_entity(tmp.path(), "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn union_schema_merges_all_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let mut a = df!["x" => &[1i32], "y" => &[2i32]].unwrap();
+        let mut b = df!["y" => &[3i32], "z" => &[4i64]].unwrap();
+        write_parquet(&mut a, &dir.join("a.parquet"));
+        write_parquet(&mut b, &dir.join("b.parquet"));
+
+        let schema = union_schema(dir).unwrap();
+        assert!(schema.contains("x"));
+        assert!(schema.contains("y"));
+        assert!(schema.contains("z"));
+        assert_eq!(schema.len(), 3);
+        // y is i32 in both files, so it stays i32
+        assert_eq!(schema.get("y").unwrap(), &DataType::Int32);
+    }
+
+    #[test]
+    fn union_schema_promotes_conflicting_types() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // a has val as i32, b has val as i64 — should promote to i64
+        let mut a = df!["val" => &[1i32]].unwrap();
+        let mut b = df!["val" => &[2i64]].unwrap();
+        write_parquet(&mut a, &dir.join("a.parquet"));
+        write_parquet(&mut b, &dir.join("b.parquet"));
+
+        let schema = union_schema(dir).unwrap();
+        assert_eq!(schema.get("val").unwrap(), &DataType::Int64);
+    }
 }
 
 /// Check if we have enough data to train a model.
