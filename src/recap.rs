@@ -526,71 +526,6 @@ pub fn run(config: &Config) -> Result<()> {
         );
     }
 
-    // --- Training Load Context ---
-    println!("\n--- Training Load ---\n");
-
-    let d7_ago = date - chrono::Duration::days(7);
-    let d28_ago = date - chrono::Duration::days(28);
-    let d56_ago = date - chrono::Duration::days(56);
-
-    let mut km_7d = 0.0;
-    let mut km_28d = 0.0;
-    let mut km_prev_28d = 0.0;
-    let mut runs_7d = 0u32;
-    let mut runs_28d = 0u32;
-    let mut long_run_28d = 0.0f64;
-
-    for i in 0..activities.height() {
-        let Some(rts) = times.get(i) else { continue };
-        let Some(rdate) =
-            chrono::DateTime::from_timestamp_micros(rts).map(|dt| dt.naive_utc().date())
-        else {
-            continue;
-        };
-        let rdist = dists.get(i).unwrap_or(0.0) / 1000.0;
-
-        // Exclude the current run from load calculations (it's the run we're analyzing)
-        if rdate == date && ids.get(i) == Some(aid) {
-            continue;
-        }
-
-        if rdate > d7_ago && rdate <= date {
-            km_7d += rdist;
-            runs_7d += 1;
-        }
-        if rdate > d28_ago && rdate <= date {
-            km_28d += rdist;
-            runs_28d += 1;
-            long_run_28d = long_run_28d.max(rdist);
-        }
-        if rdate > d56_ago && rdate <= d28_ago {
-            km_prev_28d += rdist;
-        }
-    }
-
-    println!("  Leading into this run (excluding it):");
-    println!("  7-day volume:  {:.0} km ({} runs)", km_7d, runs_7d);
-    println!("  28-day volume: {:.0} km ({} runs)", km_28d, runs_28d);
-    println!("  Longest run (28d): {:.1} km", long_run_28d);
-
-    // ACWR (4-week / 8-week)
-    if km_prev_28d > 0.0 {
-        let acwr = km_28d / km_prev_28d;
-        let (color, label) = if acwr > 1.5 {
-            ("\x1b[31m", "high — injury risk elevated")
-        } else if acwr > 1.3 {
-            ("\x1b[33m", "moderate")
-        } else if acwr < 0.8 {
-            ("\x1b[33m", "low — detraining risk")
-        } else {
-            ("\x1b[32m", "safe range")
-        };
-        println!(
-            "  Load ratio (ACWR):   {}{:.2}\x1b[0m ({})",
-            color, acwr, label
-        );
-    }
-
     // --- Comparison to Similar Runs ---
     if let Some(ref ce) = this_ce
         && all_runs.len() > 1
@@ -668,95 +603,6 @@ pub fn run(config: &Config) -> Result<()> {
         }
     }
 
-    // --- Fitness Trend ---
-    if all_runs.len() >= 10 {
-        println!("\n--- Fitness Trend ---\n");
-
-        let d28_ago = date - chrono::Duration::days(28);
-        let d56_ago = date - chrono::Duration::days(56);
-
-        let last_28d: Vec<f64> = all_runs
-            .iter()
-            .filter(|r| r.date > d28_ago)
-            .map(|r| r.ce)
-            .collect();
-        let prev_28d: Vec<f64> = all_runs
-            .iter()
-            .filter(|r| r.date > d56_ago && r.date <= d28_ago)
-            .map(|r| r.ce)
-            .collect();
-
-        if !last_28d.is_empty() && !prev_28d.is_empty() {
-            let avg_last = last_28d.iter().sum::<f64>() / last_28d.len() as f64;
-            let avg_prev = prev_28d.iter().sum::<f64>() / prev_28d.len() as f64;
-            let trend = avg_last - avg_prev;
-            let pct = trend / avg_prev * 100.0;
-
-            let (color, arrow, word) = if trend > 0.0001 {
-                ("\x1b[32m", "^", "improving")
-            } else if trend < -0.0001 {
-                ("\x1b[31m", "v", "declining")
-            } else {
-                ("\x1b[33m", "-", "stable")
-            };
-
-            println!(
-                "  28-day CE avg: {:.4}  vs prior 28d: {:.4}  ({}{} {:+.4} / {:+.1}%\x1b[0m  {})",
-                avg_last, avg_prev, color, arrow, trend, pct, word,
-            );
-        }
-
-        // Rolling 10-run average trend
-        if all_runs.len() >= 20 {
-            let last_10: Vec<f64> = all_runs[all_runs.len() - 10..]
-                .iter()
-                .map(|r| r.ce)
-                .collect();
-            let prev_10: Vec<f64> = all_runs[all_runs.len() - 20..all_runs.len() - 10]
-                .iter()
-                .map(|r| r.ce)
-                .collect();
-            let avg_l10 = last_10.iter().sum::<f64>() / 10.0;
-            let avg_p10 = prev_10.iter().sum::<f64>() / 10.0;
-            let trend10 = avg_l10 - avg_p10;
-            let (word10, color10) = if trend10 > 0.0001 {
-                ("improving", "\x1b[32m")
-            } else if trend10 < -0.0001 {
-                ("declining", "\x1b[31m")
-            } else {
-                ("stable", "\x1b[33m")
-            };
-            println!(
-                "  10-run rolling avg:  {:.4}  ({}{:+.4}\x1b[0m vs prior 10, {})",
-                avg_l10, color10, trend10, word10,
-            );
-        }
-
-        // Where this run sits in the last 5 runs
-        let last_5: Vec<&fitness::RunCE> = all_runs
-            .iter()
-            .rev()
-            .take(5)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        if last_5.len() >= 2 {
-            println!("\n  Recent trajectory:");
-            for r in &last_5 {
-                let marker = if r.activity_id == aid { " <--" } else { "" };
-                println!(
-                    "    {}  {:.4}  {}/km  {:.0}bpm{}",
-                    r.date,
-                    r.ce,
-                    fitness::format_pace(r.gap_speed),
-                    r.avg_hr,
-                    marker,
-                );
-            }
-        }
-    }
-
     // --- Overall Assessment ---
     println!("\n--- Assessment ---\n");
 
@@ -801,16 +647,6 @@ pub fn run(config: &Config) -> Result<()> {
                 "High cardiac drift ({:.1}%) — consider starting easier or checking hydration/fueling.",
                 drift.decoupling_pct,
             ));
-        }
-    }
-
-    // Training load note
-    if km_prev_28d > 0.0 {
-        let acwr = km_28d / km_prev_28d;
-        if acwr > 1.5 {
-            notes.push(
-                "Training load ratio is high. Consider an easier week to consolidate gains.".into(),
-            );
         }
     }
 

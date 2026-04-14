@@ -501,6 +501,14 @@ pub fn run(config: &Config) -> Result<()> {
         / monthly_vols.len().max(1) as f64
         * 100.0;
 
+    // Previous 28-day volume for ACWR
+    let d56_ago_train = today - chrono::Duration::days(56);
+    let vol_prev_28d: f64 = runs
+        .iter()
+        .filter(|r| r.date > d56_ago_train && r.date <= d28)
+        .map(|r| r.distance_km)
+        .sum();
+
     println!("Training (last 28 days):");
     println!(
         "  Volume:       {:.0} km  ({:.0}th percentile monthly)",
@@ -509,6 +517,16 @@ pub fn run(config: &Config) -> Result<()> {
     println!("  Runs/week:    {:.1}", runs_per_week);
     println!("  Long run:     {:.1} km", long_run_28d);
     println!("  90-day volume: {:.0} km", vol_90d);
+
+    if vol_prev_28d > 0.0 {
+        let acwr = vol_28d / vol_prev_28d;
+        let (color, label) = acwr_label(acwr);
+        println!("  Load ratio:   {}{:.2}\x1b[0m ({})", color, acwr, label);
+    }
+
+    let mut recovery_stress: Option<f64> = None;
+    let mut recovery_hrv: Option<f64> = None;
+    let mut recovery_sleep_hrs: Option<f64> = None;
 
     if let Ok(health) = health_ok {
         // Get last 7 days of health data
@@ -531,13 +549,16 @@ pub fn run(config: &Config) -> Result<()> {
             if let Some(m) = mean_of("resting_hr") {
                 println!("  Resting HR:   {:.0} bpm", m);
             }
-            if let Some(m) = mean_of("hrv_last_night") {
+            recovery_hrv = mean_of("hrv_last_night");
+            if let Some(m) = recovery_hrv {
                 println!("  HRV:          {:.0} ms", m);
             }
-            if let Some(m) = mean_of("sleep_seconds") {
-                println!("  Sleep:        {:.1} hrs", m / 3600.0);
+            recovery_sleep_hrs = mean_of("sleep_seconds").map(|s| s / 3600.0);
+            if let Some(m) = recovery_sleep_hrs {
+                println!("  Sleep:        {:.1} hrs", m);
             }
-            if let Some(m) = mean_of("avg_stress") {
+            recovery_stress = mean_of("avg_stress");
+            if let Some(m) = recovery_stress {
                 println!("  Stress:       {:.0}", m);
             }
         }
@@ -602,12 +623,336 @@ pub fn run(config: &Config) -> Result<()> {
         println!("  {:<20} r={:+.2}   ({})", name, r, desc);
     }
 
-    println!();
-    println!("To improve: build consistent weekly volume with a long run,");
-    println!("prioritize recovery (sleep, low stress), and the running");
-    println!("economy factors (cadence, ground contact) follow naturally.");
+    // --- Training Guidance ---
+    if vol_prev_28d > 0.0 {
+        let acwr = vol_28d / vol_prev_28d;
 
+        println!("\n--- This Week's Plan ---\n");
+
+        // This training week (Mon–Sun)
+        let days_into_week = actual_today.weekday().num_days_from_monday() as i64;
+        let this_monday = actual_today - chrono::Duration::days(days_into_week);
+        let this_sunday = this_monday + chrono::Duration::days(6);
+        let days_left = (this_sunday - actual_today).num_days();
+
+        let runs_this_week: Vec<&RunCE> = runs
+            .iter()
+            .filter(|r| r.date >= this_monday && r.date <= actual_today)
+            .collect();
+        let km_this_week: f64 = runs_this_week.iter().map(|r| r.distance_km).sum();
+
+        // Typical easy run (median of 90-day runs)
+        let mut recent_dists: Vec<f64> = runs_90d.iter().map(|r| r.distance_km).collect();
+        recent_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let typical_easy = if recent_dists.is_empty() {
+            8.0
+        } else {
+            recent_dists[recent_dists.len() / 2]
+        };
+
+        // Weekly volume history (Mon–Sun calendar weeks) for safety checks
+        let mut weekly_vols: Vec<f64> = Vec::new();
+        // Walk backwards through calendar weeks starting from last week
+        let last_monday = this_monday - chrono::Duration::days(7);
+        for w in 0..8i64 {
+            let week_mon = last_monday - chrono::Duration::days(7 * w);
+            let week_sun = week_mon + chrono::Duration::days(6);
+            let v: f64 = runs
+                .iter()
+                .filter(|r| r.date >= week_mon && r.date <= week_sun)
+                .map(|r| r.distance_km)
+                .sum();
+            weekly_vols.push(v);
+        }
+        let avg_weekly_vol = if weekly_vols.is_empty() {
+            vol_28d / 4.0
+        } else {
+            weekly_vols.iter().sum::<f64>() / weekly_vols.len() as f64
+        };
+
+        // Recovery assessment
+        let recovery_favorable = recovery_stress.is_none_or(|s| s < 35.0)
+            && recovery_hrv.is_none_or(|h| h > 20.0)
+            && recovery_sleep_hrs.is_none_or(|s| s > 7.0);
+
+        if acwr < 0.8 {
+            // --- Detraining: build volume back up ---
+            let target_vol = 0.85 * vol_prev_28d;
+            let vol_gap = (target_vol - vol_28d).max(0.0);
+            let weekly_target = target_vol / 4.0;
+
+            // Safe weekly ceiling: 10% above the highest of the last 4
+            // training weeks. Using the max means a sick/travel week
+            // doesn't tank the cap — your recent peak is the baseline.
+            let recent_4wk_max = if weekly_vols.len() >= 4 {
+                weekly_vols[..4].iter().cloned().fold(0.0f64, f64::max)
+            } else if weekly_vols.is_empty() {
+                avg_weekly_vol
+            } else {
+                weekly_vols.iter().cloned().fold(0.0f64, f64::max)
+            };
+            let safe_cap = recent_4wk_max * 1.10;
+            let remaining_budget = (safe_cap - km_this_week).max(0.0);
+            let already_above_avg = km_this_week > avg_weekly_vol * 1.05;
+
+            let pct_of_prev = (acwr * 100.0).round() as u32;
+            let (color, label) = acwr_label(acwr);
+            println!(
+                "  You're running {}{:.0}%\x1b[0m of the volume you were 1\u{2013}2 months ago ({}).",
+                color, pct_of_prev, label,
+            );
+            println!(
+                "  Need ~{:.0} km more over the next 28 days to stop the decline.\n",
+                vol_gap,
+            );
+            println!(
+                "  This week (Mon\u{2013}Sun): {} run(s), {:.0} km",
+                runs_this_week.len(),
+                km_this_week,
+            );
+            println!(
+                "  Best recent week: {:.0} km | Safe cap: {:.0} km (+10%)\n",
+                recent_4wk_max, safe_cap,
+            );
+
+            // Acknowledge when the user is already ramping
+            if already_above_avg {
+                let weeks_est = if vol_gap < 15.0 {
+                    "2\u{2013}3"
+                } else {
+                    "3\u{2013}4"
+                };
+                println!(
+                    "  Good news: this week ({:.0} km) is already above your recent",
+                    km_this_week,
+                );
+                println!(
+                    "  average ({:.0} km/wk). Maintain ~{:.0} km/week for {} weeks.\n",
+                    avg_weekly_vol, weekly_target, weeks_est,
+                );
+            }
+
+            // How many full easy runs fit within the safe budget?
+            let n_safe_runs = (remaining_budget / typical_easy).floor() as usize;
+
+            if remaining_budget < typical_easy * 0.5 {
+                // Already near the weekly cap — suggest rest or a short jog
+                if already_above_avg {
+                    println!("  Rest of week: recovery or 1 short jog to maintain frequency.");
+                } else {
+                    let short_km = remaining_budget.round().max(3.0);
+                    println!(
+                        "  Near your safe cap \u{2014} 1 \u{00d7} {:.0} km easy to keep building.",
+                        short_km,
+                    );
+                    let acwr_one = (vol_28d + short_km) / vol_prev_28d;
+                    let (c1, l1) = acwr_label(acwr_one);
+                    println!(
+                        "     \u{2192} {}{}\x1b[0m ({:.0}%)",
+                        c1,
+                        l1,
+                        acwr_one * 100.0
+                    );
+                }
+            } else {
+                // Room for more runs within safe limits
+                let n_easy = n_safe_runs.min(((days_left + 1) / 2) as usize).max(1);
+
+                // Scenario A: easy runs
+                // Note: projected ACWR is approximate — it adds volume to the
+                // current 28-day window without subtracting runs that will age
+                // out. The error is small within a single week.
+                let vol_a = typical_easy * n_easy as f64;
+                let acwr_a = (vol_28d + vol_a) / vol_prev_28d;
+                let week_a = km_this_week + vol_a;
+                let (ca, la) = acwr_label(acwr_a);
+
+                println!(
+                    "  A) {} \u{00d7} {:.0} km easy  |  ~{:.0} km this week",
+                    n_easy, typical_easy, week_a,
+                );
+                println!(
+                    "     \u{2192} {}{}\x1b[0m ({:.0}% of prior volume)",
+                    ca,
+                    la,
+                    acwr_a * 100.0,
+                );
+
+                // Scenario B: include a long run, fit easy runs around it
+                if days_left >= 3 {
+                    let long_target = if long_run_28d > typical_easy * 1.2 {
+                        (long_run_28d * 1.10).round()
+                    } else {
+                        (typical_easy * 1.5).round()
+                    };
+
+                    // How many easy runs fit alongside the long run within budget?
+                    if long_target <= remaining_budget {
+                        let budget_after_long = remaining_budget - long_target;
+                        let n_easy_b = (budget_after_long / typical_easy).floor() as usize;
+                        // Cap easy runs by available days (need 1 day for the long run)
+                        let n_easy_b = n_easy_b.min(days_left.saturating_sub(1) as usize);
+                        let vol_b = typical_easy * n_easy_b as f64 + long_target;
+                        let acwr_b = (vol_28d + vol_b) / vol_prev_28d;
+                        let week_b = km_this_week + vol_b;
+                        let (cb, lb) = acwr_label(acwr_b);
+
+                        println!();
+                        if n_easy_b > 0 {
+                            println!(
+                                "  B) {} \u{00d7} {:.0} km easy + 1 \u{00d7} {:.0} km long  |  ~{:.0} km this week",
+                                n_easy_b, typical_easy, long_target, week_b,
+                            );
+                        } else {
+                            println!(
+                                "  B) 1 \u{00d7} {:.0} km long  |  ~{:.0} km this week",
+                                long_target, week_b,
+                            );
+                        }
+                        println!(
+                            "     \u{2192} {}{}\x1b[0m ({:.0}% of prior volume)",
+                            cb,
+                            lb,
+                            acwr_b * 100.0,
+                        );
+                        if long_target > long_run_28d + 0.5 {
+                            println!(
+                                "     \x1b[33m\u{26a0}\x1b[0m  +{:.0} km vs your recent longest ({:.0} km) \u{2014} easy pace",
+                                long_target - long_run_28d,
+                                long_run_28d,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Quality suggestion if no recent hard sessions
+            let avg_gap = if !runs_28d.is_empty() {
+                runs_28d.iter().map(|r| r.gap_speed).sum::<f64>() / runs_28d.len() as f64
+            } else {
+                0.0
+            };
+            let has_quality = runs_28d.iter().any(|r| r.gap_speed > avg_gap * 1.08);
+            if !has_quality {
+                println!();
+                println!("  No quality sessions in the last 28 days. Making one run");
+                println!("  a fartlek (4\u{00d7}2 min hard) adds stimulus without extra volume.");
+            }
+
+            // Multi-week note if scenarios can't close the gap
+            if !already_above_avg {
+                let best_vol = remaining_budget.min(typical_easy * 3.0);
+                let best_acwr = (vol_28d + best_vol) / vol_prev_28d;
+                if best_acwr < 0.80 {
+                    println!();
+                    println!(
+                        "  Can't stop the decline in one week \u{2014} aim for ~{:.0} km/week",
+                        weekly_target,
+                    );
+                    let weeks_est = if vol_gap < 15.0 {
+                        "2\u{2013}3"
+                    } else {
+                        "3\u{2013}4"
+                    };
+                    println!(
+                        "  consistently over the next {} weeks to reach maintaining.",
+                        weeks_est,
+                    );
+                }
+            }
+
+            // Recovery note
+            println!();
+            if recovery_favorable {
+                println!("  Recovery: sleep/HRV/stress look favorable \u{2014} room to push.");
+            } else {
+                let mut concerns = Vec::new();
+                if recovery_stress.is_some_and(|s| s >= 35.0) {
+                    concerns.push("elevated stress");
+                }
+                if recovery_hrv.is_some_and(|h| h <= 20.0) {
+                    concerns.push("low HRV");
+                }
+                if recovery_sleep_hrs.is_some_and(|s| s <= 7.0) {
+                    concerns.push("short sleep");
+                }
+                if !concerns.is_empty() {
+                    println!(
+                        "  Recovery: {} \u{2014} favor easy effort this week.",
+                        concerns.join(", "),
+                    );
+                } else {
+                    println!("  Recovery: looks OK.");
+                }
+            }
+        } else if acwr > 1.3 {
+            // --- Overtraining risk: pull back ---
+            let safe_vol = 1.2 * vol_prev_28d;
+            let excess = (vol_28d - safe_vol).max(0.0);
+            let pct_of_prev = (acwr * 100.0).round() as u32;
+            let (color, label) = acwr_label(acwr);
+
+            println!(
+                "  You're running {}{:.0}%\x1b[0m of the volume you were 1\u{2013}2 months ago ({}).",
+                color, pct_of_prev, label,
+            );
+            if excess > 0.0 {
+                println!(
+                    "  That's ~{:.0} km above a sustainable 28-day load.\n",
+                    excess
+                );
+            }
+            let reduced = (typical_easy * 0.7).round().max(3.0);
+            let n_runs = (runs_per_week - 1.0).max(2.0).round() as u32;
+            println!(
+                "  Suggestion: {} \u{00d7} {:.0} km easy, skip the long run this week.",
+                n_runs, reduced,
+            );
+            println!("  A lighter week lets adaptations settle and prevents injury.");
+
+            if !recovery_favorable {
+                println!();
+                println!("  Recovery metrics support backing off \u{2014} prioritize rest.");
+            }
+        } else {
+            // --- Safe range ---
+            let target_weekly = vol_28d / 4.0;
+            let (color, label) = acwr_label(acwr);
+            println!(
+                "  You're at {}{:.0}%\x1b[0m of prior volume ({}).  Maintain ~{:.0} km/week.",
+                color,
+                acwr * 100.0,
+                label,
+                target_weekly,
+            );
+            if acwr > 1.1 {
+                println!("  Trending toward building \u{2014} don't add volume next week.");
+            } else if acwr < 0.9 {
+                println!("  Toward the low end \u{2014} an extra short run this week helps.");
+            }
+        }
+    }
+
+    println!();
     Ok(())
+}
+
+/// Map an ACWR value to a color code and human-readable label describing
+/// what it means for training trajectory.
+fn acwr_label(acwr: f64) -> (&'static str, &'static str) {
+    if acwr > 1.5 {
+        ("\x1b[31m", "injury risk \u{2014} volume spiking")
+    } else if acwr > 1.3 {
+        ("\x1b[33m", "building aggressively \u{2014} back off soon")
+    } else if acwr > 1.0 {
+        ("\x1b[32m", "building fitness")
+    } else if acwr >= 0.8 {
+        ("\x1b[32m", "maintaining")
+    } else if acwr >= 0.6 {
+        ("\x1b[33m", "losing fitness")
+    } else {
+        ("\x1b[31m", "detraining rapidly")
+    }
 }
 
 // ---------------------------------------------------------------------------
