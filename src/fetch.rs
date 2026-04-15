@@ -2347,7 +2347,8 @@ async fn fetch_nutrition(
 
     while date <= to {
         let ym = (date.year(), date.month());
-        let is_today = date == today;
+        let yesterday = today - Duration::days(1);
+        let is_recent = date == today || date == yesterday;
 
         // Flush previous month when we cross a boundary.
         if let Some(prev) = current_month
@@ -2361,7 +2362,7 @@ async fn fetch_nutrition(
         }
         current_month = Some(ym);
 
-        if !is_today && existing.contains(&date) {
+        if !is_recent && existing.contains(&date) {
             skipped += 1;
         } else {
             match fetch_nutrition_day(client, date).await {
