@@ -165,6 +165,32 @@ pub fn run(config: &Config) -> Result<()> {
                 .unwrap_or_default(),
         );
 
+        // Show temperature adjustment when impact is meaningful (>= 0.0005 CE)
+        if let Some(t) = ce.avg_temp {
+            let temp_delta = t - fitness::TEMP_REF;
+            let ce_adjustment = -fitness::TEMP_COEFF * temp_delta;
+            if ce_adjustment.abs() >= 0.0005 {
+                let direction = if temp_delta > 0.0 { "heat" } else { "cold" };
+                println!(
+                    "  Temp adjustment:     {:+.4}  ({:.0}°C vs {:.0}°C ref — {} {} raw efficiency by {:.1}%)",
+                    ce_adjustment,
+                    t,
+                    fitness::TEMP_REF,
+                    direction,
+                    if temp_delta > 0.0 {
+                        "reduced"
+                    } else {
+                        "boosted"
+                    },
+                    if ce.ce_raw > 0.0 {
+                        (ce_adjustment / ce.ce_raw * 100.0).abs()
+                    } else {
+                        0.0
+                    },
+                );
+            }
+        }
+
         // Running dynamics
         // Garmin stores cadence as single-leg (steps/min for one foot),
         // stride_length in cm, and ground_contact_time in ms.
@@ -274,6 +300,61 @@ pub fn run(config: &Config) -> Result<()> {
                 println!("\n  Cardiac Drift:       n/a (interval workout — HR too variable)");
             }
             Err(_) => {}
+        }
+    }
+
+    // --- Late-run Fade Detection ---
+    let fade = if detail_path.exists() && dist_km >= 5.0 {
+        fitness::compute_run_fade(&detail_path)
+    } else {
+        None
+    };
+
+    if let Some(ref fade) = fade
+        && fade.fade_detected
+    {
+        println!(
+            "\n  \x1b[33mLate-run fade detected\x1b[0m  (CE dropped {:.1}% from peak to final quarter)",
+            fade.ce_drop_pct
+        );
+
+        // Quarter-by-quarter breakdown
+        println!(
+            "\n  {:>10}  {:>8}  {:>8}  {:>6}",
+            "Quarter", "CE", "GAP", "Cad"
+        );
+        for (i, ((ce_val, gap), cad)) in fade
+            .quarter_ce
+            .iter()
+            .zip(&fade.quarter_gap)
+            .zip(&fade.quarter_cadence)
+            .enumerate()
+        {
+            let cad_s = cad
+                .map(|c| format!("{:.0}", c))
+                .unwrap_or_else(|| "---".into());
+            let marker = if i == 3 && fade.fade_detected {
+                " \x1b[33m<--\x1b[0m"
+            } else {
+                ""
+            };
+            println!(
+                "  {:>10}  {:>8.4}  {:>8}  {:>6}{}",
+                format!("Q{}", i + 1),
+                ce_val,
+                fitness::format_pace(*gap),
+                cad_s,
+                marker,
+            );
+        }
+
+        if let Some(cad_drop) = fade.cadence_drop_spm
+            && cad_drop >= 6.0
+        {
+            println!(
+                "\n  Cadence dropped {:.0} spm — consistent with bonking or dehydration.",
+                cad_drop,
+            );
         }
     }
 
@@ -558,6 +639,14 @@ pub fn run(config: &Config) -> Result<()> {
             let avg_gap = similar.iter().map(|r| r.gap_speed).sum::<f64>() / similar.len() as f64;
             let avg_hr = similar.iter().map(|r| r.avg_hr).sum::<f64>() / similar.len() as f64;
 
+            // Temperature comparison
+            let similar_temps: Vec<f64> = similar.iter().filter_map(|r| r.avg_temp).collect();
+            let avg_similar_temp = if !similar_temps.is_empty() {
+                Some(similar_temps.iter().sum::<f64>() / similar_temps.len() as f64)
+            } else {
+                None
+            };
+
             let ce_diff_pct = (ce.ce - avg_ce) / avg_ce * 100.0;
             let indicator = if ce_diff_pct > 0.5 {
                 "\x1b[32mbetter\x1b[0m"
@@ -567,20 +656,35 @@ pub fn run(config: &Config) -> Result<()> {
                 "similar"
             };
 
-            println!("  {:>20}  {:>8}  {:>8}  {:>8}", "", "CE", "GAP", "Avg HR");
+            let has_temps = ce.avg_temp.is_some() || avg_similar_temp.is_some();
+            let temp_header = if has_temps { "  Temp" } else { "" };
+            let this_temp_s = ce
+                .avg_temp
+                .map(|t| format!("  {:>4.0}°C", t))
+                .unwrap_or_default();
+            let sim_temp_s = avg_similar_temp
+                .map(|t| format!("  {:>4.0}°C", t))
+                .unwrap_or_default();
+
             println!(
-                "  {:>20}  {:>8.4}  {:>8}  {:>8.0}",
+                "  {:>20}  {:>8}  {:>8}  {:>8}{}",
+                "", "CE", "GAP", "Avg HR", temp_header,
+            );
+            println!(
+                "  {:>20}  {:>8.4}  {:>8}  {:>8.0}{}",
                 "This run",
                 ce.ce,
                 fitness::format_pace(ce.gap_speed),
                 ce.avg_hr,
+                this_temp_s,
             );
             println!(
-                "  {:>20}  {:>8.4}  {:>8}  {:>8.0}",
+                "  {:>20}  {:>8.4}  {:>8}  {:>8.0}{}",
                 format!("Avg of {} similar", similar.len()),
                 avg_ce,
                 fitness::format_pace(avg_gap),
                 avg_hr,
+                sim_temp_s,
             );
             println!(
                 "\n  This run was {} than similar recent runs ({:+.1}% CE)",
@@ -633,6 +737,57 @@ pub fn run(config: &Config) -> Result<()> {
                 notes.push("Efficiency was in line with your recent average.".into());
             }
         }
+    }
+
+    // Temperature assessment
+    if let Some(ref ce) = this_ce
+        && let Some(t) = ce.avg_temp
+    {
+        let temp_delta = t - fitness::TEMP_REF;
+        let ce_adjustment = -fitness::TEMP_COEFF * temp_delta;
+        if temp_delta >= 5.0 {
+            let raw_diff_pct = if ce.ce_raw > 0.0 {
+                (ce_adjustment / ce.ce_raw * 100.0).abs()
+            } else {
+                0.0
+            };
+            notes.push(format!(
+                "Hot run ({:.0}°C). Heat cost ~{:.1}% raw efficiency — \
+                 adjusted CE accounts for this. Raw pace/HR may look worse than usual.",
+                t, raw_diff_pct,
+            ));
+        } else if temp_delta <= -10.0 {
+            notes.push(format!(
+                "Cold run ({:.0}°C). Cool temps boosted raw efficiency — \
+                 adjusted CE removes this benefit for fair comparison.",
+                t,
+            ));
+        }
+    }
+
+    // Fade assessment
+    if let Some(ref fade) = fade
+        && fade.fade_detected
+    {
+        let mut msg = format!(
+            "Late-run fade: efficiency dropped {:.0}% in the final quarter.",
+            fade.ce_drop_pct,
+        );
+        if let Some(cad_drop) = fade.cadence_drop_spm
+            && cad_drop >= 6.0
+        {
+            msg.push_str(&format!(
+                " Cadence fell {:.0} spm — typical of dehydration or fueling deficit.",
+                cad_drop,
+            ));
+        }
+        // If hot, tie them together
+        if let Some(ref ce) = this_ce
+            && ce.avg_temp.map(|t| t >= 25.0).unwrap_or(false)
+        {
+            msg.push_str(" Heat likely accelerated the fade — hydration is critical above 25°C.");
+        }
+        notes.push(msg);
     }
 
     // Drift assessment

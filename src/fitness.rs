@@ -1043,6 +1043,114 @@ pub fn compute_run_drift(
     })
 }
 
+// ---------------------------------------------------------------------------
+
+/// Late-run fade detection result.
+pub struct RunFade {
+    /// Per-quarter CE values (up to 4).
+    pub quarter_ce: Vec<f64>,
+    /// Per-quarter average cadence (spm, double-leg), if available.
+    pub quarter_cadence: Vec<Option<f64>>,
+    /// Per-quarter average pace (m/s GAP).
+    pub quarter_gap: Vec<f64>,
+    /// Whether a meaningful fade was detected.
+    pub fade_detected: bool,
+    /// Percent CE drop from best quarter to final quarter.
+    pub ce_drop_pct: f64,
+    /// Cadence drop (spm) from best quarter to final quarter, if available.
+    pub cadence_drop_spm: Option<f64>,
+}
+
+/// Minimum CE drop (percent) from peak quarter to final quarter to flag a fade.
+const FADE_CE_THRESHOLD_PCT: f64 = 8.0;
+
+/// Minimum cadence drop (double-leg spm) to reinforce fade detection.
+const FADE_CADENCE_THRESHOLD: f64 = 6.0;
+
+/// Detect late-run fade by splitting the run into quarters and looking for
+/// progressive efficiency loss. A fade is flagged when the last quarter's CE
+/// drops notably below the best earlier quarter, especially when accompanied
+/// by cadence decline (a hallmark of bonking / dehydration).
+pub fn compute_run_fade(detail_path: &std::path::Path) -> Option<RunFade> {
+    let rows = load_steady_rows(detail_path)?;
+
+    if rows.len() < 120 {
+        return None; // need at least ~2 min to split meaningfully
+    }
+
+    // Split into 4 equal quarters by index
+    let qsize = rows.len() / 4;
+    let quarters: Vec<&[SteadyRow]> = (0..4)
+        .map(|q| {
+            let start = q * qsize;
+            let end = if q == 3 { rows.len() } else { (q + 1) * qsize };
+            &rows[start..end]
+        })
+        .collect();
+
+    let quarter_ce: Vec<f64> = quarters
+        .iter()
+        .map(|q| {
+            let avg_gap = q.iter().map(|r| r.gap_speed).sum::<f64>() / q.len() as f64;
+            let avg_hr = q.iter().map(|r| r.heart_rate).sum::<f64>() / q.len() as f64;
+            avg_gap / avg_hr
+        })
+        .collect();
+
+    let quarter_cadence: Vec<Option<f64>> = quarters
+        .iter()
+        .map(|q| {
+            let vals: Vec<f64> = q.iter().filter_map(|r| r.cadence).collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().sum::<f64>() / vals.len() as f64 * 2.0) // double-leg
+            }
+        })
+        .collect();
+
+    let quarter_gap: Vec<f64> = quarters
+        .iter()
+        .map(|q| q.iter().map(|r| r.gap_speed).sum::<f64>() / q.len() as f64)
+        .collect();
+
+    // Find best CE among first 3 quarters (the "peak before fade")
+    let best_early_ce = quarter_ce[..3]
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let final_ce = quarter_ce[3];
+    let ce_drop_pct = (best_early_ce - final_ce) / best_early_ce * 100.0;
+
+    // Cadence drop: best early quarter vs final
+    let best_early_cad = quarter_cadence[..3]
+        .iter()
+        .filter_map(|c| *c)
+        .fold(None, |acc: Option<f64>, v| {
+            Some(acc.map_or(v, |a| a.max(v)))
+        });
+    let cadence_drop_spm = match (best_early_cad, quarter_cadence[3]) {
+        (Some(early), Some(final_cad)) => Some(early - final_cad),
+        _ => None,
+    };
+
+    // Fade = significant CE drop, optionally reinforced by cadence drop
+    let cadence_confirms = cadence_drop_spm
+        .map(|d| d >= FADE_CADENCE_THRESHOLD)
+        .unwrap_or(false);
+    let fade_detected =
+        ce_drop_pct >= FADE_CE_THRESHOLD_PCT || (ce_drop_pct >= 5.0 && cadence_confirms);
+
+    Some(RunFade {
+        quarter_ce,
+        quarter_cadence,
+        quarter_gap,
+        fade_detected,
+        ce_drop_pct,
+        cadence_drop_spm,
+    })
+}
+
 /// Cardiac drift report entry point.
 pub fn drift(config: &Config) -> Result<()> {
     let activities = data::load_activities(config)?
