@@ -5,6 +5,7 @@ mod error;
 mod features;
 mod fetch;
 mod fitness;
+mod health;
 mod injury_risk;
 mod model;
 mod races;
@@ -124,6 +125,13 @@ enum Commands {
     /// including CE, drift, splits, recovery context, comparison to similar
     /// runs, and fitness trend.
     Recap,
+    /// Daily health dashboard: weight, nutrition, sleep, stress, recovery,
+    /// blood pressure, and training context over a recent window.
+    Health {
+        /// Number of days to show (default 7)
+        #[arg(long, default_value = "7")]
+        days: u32,
+    },
 }
 
 #[tokio::main]
@@ -225,6 +233,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Recap => {
             recap::run(&config)?;
+        }
+        Commands::Health { days } => {
+            health::run(&config, days)?;
         }
     }
 
