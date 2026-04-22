@@ -58,6 +58,8 @@ pub struct SteadyRow {
     pub cadence: Option<f64>,
     pub gct: Option<f64>,
     pub stride: Option<f64>,
+    /// Fractional grade at this point (e.g. 0.05 = 5% uphill).
+    pub grade: f64,
 }
 
 /// Load a detail parquet and extract filtered, grade-adjusted per-second rows.
@@ -143,6 +145,7 @@ pub fn load_steady_rows(detail_path: &std::path::Path) -> Option<Vec<SteadyRow>>
             cadence: cadence_f.and_then(|f| f.get(i)),
             gct: gct_f.and_then(|f| f.get(i)),
             stride: stride_f.and_then(|f| f.get(i)),
+            grade,
         });
     }
 
@@ -1059,6 +1062,11 @@ pub struct RunFade {
     pub ce_drop_pct: f64,
     /// Cadence drop (spm) from best quarter to final quarter, if available.
     pub cadence_drop_spm: Option<f64>,
+    /// Per-quarter average absolute grade (fraction, e.g. 0.04 = 4%).
+    pub quarter_abs_grade: Vec<f64>,
+    /// True when Q4 is notably hillier than earlier quarters, meaning the CE
+    /// drop is likely terrain-driven rather than a genuine fitness fade.
+    pub terrain_driven: bool,
 }
 
 /// Minimum CE drop (percent) from peak quarter to final quarter to flag a fade.
@@ -1114,6 +1122,12 @@ pub fn compute_run_fade(detail_path: &std::path::Path) -> Option<RunFade> {
         .map(|q| q.iter().map(|r| r.gap_speed).sum::<f64>() / q.len() as f64)
         .collect();
 
+    // Per-quarter average absolute grade
+    let quarter_abs_grade: Vec<f64> = quarters
+        .iter()
+        .map(|q| q.iter().map(|r| r.grade.abs()).sum::<f64>() / q.len() as f64)
+        .collect();
+
     // Find best CE among first 3 quarters (the "peak before fade")
     let best_early_ce = quarter_ce[..3]
         .iter()
@@ -1134,12 +1148,24 @@ pub fn compute_run_fade(detail_path: &std::path::Path) -> Option<RunFade> {
         _ => None,
     };
 
-    // Fade = significant CE drop, optionally reinforced by cadence drop
+    // Detect terrain-driven CE drop: Q4 is notably hillier than earlier quarters.
+    // GAP adjusts for metabolic cost per step, but steep undulating terrain causes
+    // HR lag (HR overshoots on climbs and stays elevated on descents), so CE drops
+    // even when effort is appropriate for the terrain.
+    let early_avg_abs_grade: f64 = quarter_abs_grade[..3].iter().sum::<f64>() / 3.0;
+    let q4_abs_grade = quarter_abs_grade[3];
+    let terrain_driven = ce_drop_pct >= 5.0
+        && (early_avg_abs_grade > 0.0 && q4_abs_grade / early_avg_abs_grade >= 1.5
+            || q4_abs_grade - early_avg_abs_grade >= 0.015);
+
+    // Fade = significant CE drop, optionally reinforced by cadence drop.
+    // Terrain suppresses CE-only fades, but cadence-confirmed fades are
+    // biomechanical (bonking/dehydration) and stand regardless of terrain.
     let cadence_confirms = cadence_drop_spm
         .map(|d| d >= FADE_CADENCE_THRESHOLD)
         .unwrap_or(false);
-    let fade_detected =
-        ce_drop_pct >= FADE_CE_THRESHOLD_PCT || (ce_drop_pct >= 5.0 && cadence_confirms);
+    let fade_detected = ce_drop_pct >= FADE_CE_THRESHOLD_PCT && !terrain_driven
+        || (ce_drop_pct >= 5.0 && cadence_confirms);
 
     Some(RunFade {
         quarter_ce,
@@ -1148,6 +1174,8 @@ pub fn compute_run_fade(detail_path: &std::path::Path) -> Option<RunFade> {
         fade_detected,
         ce_drop_pct,
         cadence_drop_spm,
+        quarter_abs_grade,
+        terrain_driven,
     })
 }
 

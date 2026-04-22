@@ -311,23 +311,31 @@ pub fn run(config: &Config) -> Result<()> {
     };
 
     if let Some(ref fade) = fade
-        && fade.fade_detected
+        && (fade.fade_detected || fade.terrain_driven)
     {
-        println!(
-            "\n  \x1b[33mLate-run fade detected\x1b[0m  (CE dropped {:.1}% from peak to final quarter)",
-            fade.ce_drop_pct
-        );
+        if fade.fade_detected {
+            println!(
+                "\n  \x1b[33mLate-run fade detected\x1b[0m  (CE dropped {:.1}% from peak to final quarter)",
+                fade.ce_drop_pct
+            );
+        } else {
+            println!(
+                "\n  CE dropped {:.1}% in final quarter — likely terrain-driven (steeper hills, not a fade)",
+                fade.ce_drop_pct
+            );
+        }
 
         // Quarter-by-quarter breakdown
         println!(
-            "\n  {:>10}  {:>8}  {:>8}  {:>6}",
-            "Quarter", "CE", "GAP", "Cad"
+            "\n  {:>10}  {:>8}  {:>8}  {:>6}  {:>7}",
+            "Quarter", "CE", "GAP", "Cad", "Grade"
         );
-        for (i, ((ce_val, gap), cad)) in fade
+        for (i, (((ce_val, gap), cad), abs_g)) in fade
             .quarter_ce
             .iter()
             .zip(&fade.quarter_gap)
             .zip(&fade.quarter_cadence)
+            .zip(&fade.quarter_abs_grade)
             .enumerate()
         {
             let cad_s = cad
@@ -339,16 +347,18 @@ pub fn run(config: &Config) -> Result<()> {
                 ""
             };
             println!(
-                "  {:>10}  {:>8.4}  {:>8}  {:>6}{}",
+                "  {:>10}  {:>8.4}  {:>8}  {:>6}  {:>6.1}%{}",
                 format!("Q{}", i + 1),
                 ce_val,
                 fitness::format_pace(*gap),
                 cad_s,
+                abs_g * 100.0,
                 marker,
             );
         }
 
-        if let Some(cad_drop) = fade.cadence_drop_spm
+        if fade.fade_detected
+            && let Some(cad_drop) = fade.cadence_drop_spm
             && cad_drop >= 6.0
         {
             println!(
@@ -766,28 +776,38 @@ pub fn run(config: &Config) -> Result<()> {
     }
 
     // Fade assessment
-    if let Some(ref fade) = fade
-        && fade.fade_detected
-    {
-        let mut msg = format!(
-            "Late-run fade: efficiency dropped {:.0}% in the final quarter.",
-            fade.ce_drop_pct,
-        );
-        if let Some(cad_drop) = fade.cadence_drop_spm
-            && cad_drop >= 6.0
-        {
-            msg.push_str(&format!(
-                " Cadence fell {:.0} spm — typical of dehydration or fueling deficit.",
-                cad_drop,
+    if let Some(ref fade) = fade {
+        if fade.fade_detected {
+            let mut msg = format!(
+                "Late-run fade: efficiency dropped {:.0}% in the final quarter.",
+                fade.ce_drop_pct,
+            );
+            if let Some(cad_drop) = fade.cadence_drop_spm
+                && cad_drop >= 6.0
+            {
+                msg.push_str(&format!(
+                    " Cadence fell {:.0} spm — typical of dehydration or fueling deficit.",
+                    cad_drop,
+                ));
+            }
+            // If hot, tie them together
+            if let Some(ref ce) = this_ce
+                && ce.avg_temp.map(|t| t >= 25.0).unwrap_or(false)
+            {
+                msg.push_str(
+                    " Heat likely accelerated the fade — hydration is critical above 25°C.",
+                );
+            }
+            notes.push(msg);
+        } else if fade.terrain_driven {
+            notes.push(format!(
+                "CE dropped {:.0}% in the final quarter, but the terrain was significantly \
+                 hillier (avg |grade| {:.1}% vs {:.1}% earlier) — this looks terrain-driven, not a fade.",
+                fade.ce_drop_pct,
+                fade.quarter_abs_grade[3] * 100.0,
+                fade.quarter_abs_grade[..3].iter().sum::<f64>() / 3.0 * 100.0,
             ));
         }
-        // If hot, tie them together
-        if let Some(ref ce) = this_ce
-            && ce.avg_temp.map(|t| t >= 25.0).unwrap_or(false)
-        {
-            msg.push_str(" Heat likely accelerated the fade — hydration is critical above 25°C.");
-        }
-        notes.push(msg);
     }
 
     // Drift assessment
