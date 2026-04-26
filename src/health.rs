@@ -311,40 +311,18 @@ pub fn run(config: &Config, days: u32) -> Result<()> {
         map
     };
 
-    // ── Estimate BMR from last 30 days of bmr_calories ────────────
-    // Garmin's bmr_calories is reliable on full-sync days but reports
-    // wildly low values on partial syncs. We take the last 30 days,
-    // remove outliers via IQR, and use the mean.
-    let est_bmr: Option<i32> = {
-        let d30_ago = today - chrono::Duration::days(30);
-        let mut vals: Vec<f64> = Vec::new();
-        for i in 0..daily_90.height() {
-            let Some(date) = get_date(&daily_90, i) else {
+    // ── Build total-calories-burned map from daily_health ──────────
+    let total_cal_map: HashMap<NaiveDate, i32> = {
+        let mut map = HashMap::new();
+        for i in 0..daily.height() {
+            let Some(date) = get_date(&daily, i) else {
                 continue;
             };
-            if date < d30_ago {
-                continue;
-            }
-            if let Some(bmr) = opt_i32(&daily_90, "bmr_calories", i) {
-                vals.push(bmr as f64);
+            if let Some(tc) = opt_i32(&daily, "total_calories", i) {
+                map.insert(date, tc);
             }
         }
-        if vals.len() >= 5 {
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let q1 = vals[vals.len() / 4];
-            let q3 = vals[3 * vals.len() / 4];
-            let iqr = q3 - q1;
-            let lo = q1 - 1.5 * iqr;
-            let hi = q3 + 1.5 * iqr;
-            let filtered: Vec<f64> = vals.into_iter().filter(|v| *v >= lo && *v <= hi).collect();
-            if !filtered.is_empty() {
-                Some((filtered.iter().sum::<f64>() / filtered.len() as f64).round() as i32)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        map
     };
 
     // ── Header ──────────────────────────────────────────────────────
@@ -355,7 +333,7 @@ pub fn run(config: &Config, days: u32) -> Result<()> {
     print_weight_section(from_date, today, &weight_map);
 
     // ── Section 2: Nutrition ────────────────────────────────────────
-    print_nutrition_section(from_date, today, &nutrition_map, &activity_map, est_bmr);
+    print_nutrition_section(from_date, today, &nutrition_map, &total_cal_map);
 
     // ── Section 3: Sleep ────────────────────────────────────────────
     print_sleep_section(from_date, today, &daily);
@@ -385,7 +363,7 @@ pub fn run(config: &Config, days: u32) -> Result<()> {
         &daily,
         &activity_map,
         rest_day_baseline_stress,
-        est_bmr,
+        &total_cal_map,
     );
 
     Ok(())
@@ -459,8 +437,7 @@ fn print_nutrition_section(
     from: NaiveDate,
     to: NaiveDate,
     nutrition_map: &HashMap<NaiveDate, NutritionDay>,
-    activity_map: &HashMap<NaiveDate, Vec<ActivitySummary>>,
-    est_bmr: Option<i32>,
+    total_cal_map: &HashMap<NaiveDate, i32>,
 ) {
     println!("--- Nutrition ---\n");
 
@@ -507,15 +484,8 @@ fn print_nutrition_section(
             .map(|f| format!("{:.0}g", f))
             .unwrap_or_else(|| "---".into());
 
-        // Estimated burn = sedentary TDEE + activity calories
-        let activity_cal: i32 = activity_map
-            .get(*date)
-            .map(|acts| acts.iter().filter_map(|a| a.calories).sum())
-            .unwrap_or(0);
-
-        let balance_s = match (n.consumed_calories, est_bmr) {
-            (Some(consumed), Some(bmr)) => {
-                let burned = bmr + activity_cal;
+        let balance_s = match (n.consumed_calories, total_cal_map.get(*date)) {
+            (Some(consumed), Some(&burned)) => {
                 let bal = consumed - burned;
                 total_consumed += consumed as i64;
                 total_burned += burned as i64;
@@ -958,7 +928,7 @@ fn print_insights(
     daily: &DataFrame,
     activity_map: &HashMap<NaiveDate, Vec<ActivitySummary>>,
     rest_day_baseline: Option<f64>,
-    est_bmr: Option<i32>,
+    total_cal_map: &HashMap<NaiveDate, i32>,
 ) {
     println!("--- Insights ---\n");
 
@@ -983,7 +953,7 @@ fn print_insights(
         println!("  Weight: {:+.1} kg over window ({})", change, direction);
     }
 
-    // Calorie balance (using IQR-filtered BMR + activity calories)
+    // Calorie balance (using Garmin total daily burn)
     if !nutrition_map.is_empty() {
         let mut total_consumed = 0i64;
         let mut total_burned = 0i64;
@@ -992,14 +962,10 @@ fn print_insights(
         for (date, n) in nutrition_map {
             if *date >= from
                 && *date <= to
-                && let (Some(c), Some(bmr)) = (n.consumed_calories, est_bmr)
+                && let (Some(c), Some(&burned)) = (n.consumed_calories, total_cal_map.get(date))
             {
-                let activity_cal: i32 = activity_map
-                    .get(date)
-                    .map(|acts| acts.iter().filter_map(|a| a.calories).sum())
-                    .unwrap_or(0);
                 total_consumed += c as i64;
-                total_burned += (bmr + activity_cal) as i64;
+                total_burned += burned as i64;
                 count += 1;
             }
         }

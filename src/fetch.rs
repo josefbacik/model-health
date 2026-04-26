@@ -145,6 +145,9 @@ async fn fetch_daily_loop(
     let mut errors = 0i64;
     let started = Instant::now();
 
+    let today = Utc::now().date_naive();
+    let yesterday = today - Duration::days(1);
+
     while date <= to {
         let ym = (date.year(), date.month());
 
@@ -158,8 +161,11 @@ async fn fetch_daily_loop(
         }
         current_month = Some(ym);
 
-        let has_health = existing_health.contains(&date);
-        let has_perf = existing_perf.contains(&date);
+        // Always re-fetch today and yesterday — Garmin updates total_calories,
+        // stress, body battery, etc. throughout the day and after final sync.
+        let is_recent = date == today || date == yesterday;
+        let has_health = !is_recent && existing_health.contains(&date);
+        let has_perf = !is_recent && existing_perf.contains(&date);
         let was_skipped = has_health && has_perf;
 
         if was_skipped {
